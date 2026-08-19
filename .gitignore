@@ -1,0 +1,9 @@
+bench_gemm
+*.o
+*.ptx
+*.cubin
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+.DS_Store
+build/
