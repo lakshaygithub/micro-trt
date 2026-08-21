@@ -11,7 +11,7 @@
 namespace {
 
 // Straightforward triple-nested-loop GEMM on the CPU. This is the ground truth:
-// if the GPU result does not match this, the kernel is wrong, no matter how fast
+// if a GPU result does not match this, the kernel is wrong, no matter how fast
 // it is. Never benchmark a kernel you have not first proven correct.
 void gemm_cpu_reference(const std::vector<float>& A,
                         const std::vector<float>& B,
@@ -30,8 +30,7 @@ void gemm_cpu_reference(const std::vector<float>& A,
 
 // Float comparison must be tolerant. The GPU sums in a different order than the
 // CPU, and floating-point addition is not associative, so bit-exact equality is
-// the wrong test. We use a relative tolerance scaled by K, since accumulated
-// rounding error grows with the length of the dot product.
+// the wrong test.
 bool allclose(const std::vector<float>& got,
               const std::vector<float>& want,
               float rel_tol) {
@@ -42,7 +41,7 @@ bool allclose(const std::vector<float>& got,
         const float diff = std::fabs(got[i] - want[i]);
         const float scale = std::fmax(1.0f, std::fabs(want[i]));
         if (diff / scale > rel_tol) {
-            std::printf("  mismatch at %zu: got %f, want %f\n", i, got[i], want[i]);
+            std::printf("\n  mismatch at %zu: got %f, want %f\n", i, got[i], want[i]);
             return false;
         }
     }
@@ -58,30 +57,28 @@ std::vector<float> random_matrix(int rows, int cols, std::mt19937& rng) {
     return out;
 }
 
-// Times a kernel with CUDA events rather than a CPU clock.
+// Times any kernel matching GemmFn, using CUDA events rather than a CPU clock.
 //
 // Why events: kernel launches are asynchronous. A CPU timer around the launch
-// measures how long it took to *queue* the work, which is close to zero and
-// completely meaningless. Events are recorded in the GPU's own stream and
-// measure actual device execution time.
-float time_kernel_ms(const Tensor& A, const Tensor& B, Tensor& C, int iters) {
+// measures how long it took to *queue* the work, which is meaningless. Events
+// are recorded in the GPU's own stream and measure device execution time.
+float time_kernel_ms(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
+                     int iters) {
     cudaEvent_t start;
     cudaEvent_t stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    // Warm-up. The first launch pays one-time costs (context setup, JIT of the
-    // PTX for this exact GPU) that would otherwise pollute the measurement.
-    gemm_naive(A, B, C);
+    // Warm-up: the first launch pays one-time costs (context setup, JIT of PTX
+    // for this exact GPU) that would otherwise pollute the measurement.
+    fn(A, B, C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
-        gemm_naive(A, B, C);
+        fn(A, B, C);
     }
     CUDA_CHECK(cudaEventRecord(stop));
-
-    // Block the CPU until the stop event actually happens on the GPU.
     CUDA_CHECK(cudaEventSynchronize(stop));
 
     float total_ms = 0.0f;
@@ -93,6 +90,30 @@ float time_kernel_ms(const Tensor& A, const Tensor& B, Tensor& C, int iters) {
     return total_ms / static_cast<float>(iters);
 }
 
+struct Result {
+    const char* name;
+    float ms;
+    double gflops;
+    bool correct;
+};
+
+Result evaluate(const char* name, GemmFn fn,
+                const Tensor& dA, const Tensor& dB, Tensor& dC,
+                const std::vector<float>& cpu_result,
+                int M, int N, int K, int iters) {
+    // Correctness first, always.
+    fn(dA, dB, dC);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const bool ok = allclose(dC.download(), cpu_result, 1e-3f);
+
+    const float ms = time_kernel_ms(fn, dA, dB, dC, iters);
+
+    const double flops = 2.0 * M * N * K;  // one multiply + one add per MAC
+    const double gflops = (flops / (ms / 1000.0)) / 1e9;
+
+    return Result{name, ms, gflops, ok};
+}
+
 void print_device_info() {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -100,14 +121,16 @@ void print_device_info() {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    std::printf("GPU: %s (compute capability %d.%d, %d SMs)\n\n",
+    std::printf("GPU: %s (compute capability %d.%d, %d SMs)\n",
                 prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+    std::printf("Shared memory per block: %zu KB | Peak memory bandwidth: %.0f GB/s\n\n",
+                prop.sharedMemPerBlock / 1024,
+                2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / 1.0e6);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Square matrices by default; override with `./bench 2048`.
     int size = 1024;
     if (argc > 1) {
         size = std::stoi(argv[1]);
@@ -129,33 +152,37 @@ int main(int argc, char** argv) {
     dA.upload(hA);
     dB.upload(hB);
 
-    // ---- Correctness ----
-    gemm_naive(dA, dB, dC);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const std::vector<float> gpu_result = dC.download();
-
-    std::printf("Checking against CPU reference... ");
+    std::printf("Computing CPU reference... ");
     std::fflush(stdout);
-
     std::vector<float> cpu_result(static_cast<std::size_t>(M) * N);
     gemm_cpu_reference(hA, hB, cpu_result, M, N, K);
+    std::printf("done\n\n");
 
-    if (!allclose(gpu_result, cpu_result, 1e-3f)) {
-        std::printf("FAILED\n");
-        return 1;
-    }
-    std::printf("passed\n\n");
-
-    // ---- Performance ----
     const int iters = 20;
-    const float ms = time_kernel_ms(dA, dB, dC, iters);
+    const Result results[] = {
+        evaluate("gemm_naive", gemm_naive, dA, dB, dC, cpu_result, M, N, K, iters),
+        evaluate("gemm_tiled", gemm_tiled, dA, dB, dC, cpu_result, M, N, K, iters),
+    };
 
-    // A GEMM does M*N*K multiply-adds; each is 2 floating-point operations.
-    const double flops = 2.0 * M * N * K;
-    const double gflops = (flops / (ms / 1000.0)) / 1e9;
+    std::printf("%-14s %10s %14s %10s %8s\n",
+                "kernel", "time (ms)", "GFLOP/s", "vs naive", "correct");
+    std::printf("--------------------------------------------------------------\n");
 
-    std::printf("gemm_naive : %8.3f ms   %8.2f GFLOP/s\n", ms, gflops);
-    std::printf("\n(Baseline established. Tiled version comes next.)\n");
+    const double baseline_ms = results[0].ms;
+    for (const Result& r : results) {
+        std::printf("%-14s %10.3f %14.2f %9.2fx %8s\n",
+                    r.name, r.ms, r.gflops,
+                    baseline_ms / r.ms,
+                    r.correct ? "yes" : "NO");
+    }
+
+    // Every kernel must be correct; a fast wrong answer is a failure.
+    for (const Result& r : results) {
+        if (!r.correct) {
+            std::printf("\n%s produced incorrect results.\n", r.name);
+            return 1;
+        }
+    }
 
     return 0;
 }
