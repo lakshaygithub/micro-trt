@@ -20,8 +20,8 @@ __global__ void gemm_naive_kernel(const float* __restrict__ A,
     // is the fastest-varying dimension, so consecutive threads get consecutive
     // columns, which makes their writes to C contiguous. That is memory
     // coalescing: the hardware merges 32 adjacent accesses into one transaction.
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Grids are launched in whole blocks, so if M or N is not a multiple of the
     // block size we launch more threads than there are output elements. Those
@@ -49,7 +49,7 @@ void gemm_naive(const Tensor& A, const Tensor& B, Tensor& C) {
 
     // 16x16 = 256 threads per block. Blocks are scheduled as 32-thread warps,
     // so keep the count a multiple of 32; 128-512 is the usual sweet spot.
-    const dim3 block(16, 16);
+    const dim3 block(8, 8);
 
     // Ceiling division: we need enough blocks to cover every output element,
     // rounding up. (a + b - 1) / b is integer ceil(a / b).
