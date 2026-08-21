@@ -49,7 +49,7 @@ void gemm_naive(const Tensor& A, const Tensor& B, Tensor& C) {
 
     // 16x16 = 256 threads per block. Blocks are scheduled as 32-thread warps,
     // so keep the count a multiple of 32; 128-512 is the usual sweet spot.
-    const dim3 block(8, 8);
+    const dim3 block(16, 16);
 
     // Ceiling division: we need enough blocks to cover every output element,
     // rounding up. (a + b - 1) / b is integer ceil(a / b).
