@@ -26,9 +26,7 @@ __global__ void gemm_naive_kernel(const float* __restrict__ A,
     // Grids are launched in whole blocks, so if M or N is not a multiple of the
     // block size we launch more threads than there are output elements. Those
     // extra threads must not write anywhere.
-    if (row >= M || col >= N) {
-        return;
-    }
+    
 
     // Accumulate in a register. Writing straight into C[...] inside the loop
     // would be a global-memory round trip per iteration.
