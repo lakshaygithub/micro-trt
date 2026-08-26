@@ -8,6 +8,7 @@
 #include <random>
 #include <string>
 #include <algorithm>
+#include <chrono>
 
 namespace {
 
@@ -70,8 +71,7 @@ float time_kernel_ms(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    // Warm-up: the first launch pays one-time costs (context setup, JIT of PTX
-    // for this exact GPU) that would otherwise pollute the measurement.
+    // Small warm-up for this specific kernel, on top of the device-level one.
     fn(A, B, C);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -91,24 +91,34 @@ float time_kernel_ms(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
     return total_ms / static_cast<float>(iters);
 }
 
-// Drives the GPU under sustained load until its clocks reach steady state.
+// Runs the GPU under load until it reaches full clock speed.
 //
-// GPUs idle at a low clock and boost when work arrives, and the ramp takes
-// noticeably longer than a single kernel launch. Without this, the first
-// measurements are taken mid-ramp: they look slow, and whichever kernel happens
-// to run first is unfairly penalised while later kernels benefit from the
-// warm-up it paid for.
+// GPUs idle at a low clock and speed up once work arrives. If you start timing
+// before that happens, early measurements come out slow, and whichever kernel
+// runs first is penalised while later ones benefit from the warm-up it paid for.
 //
-// The symptom to recognise is a median that sits almost on top of the minimum
-// with a long tail toward the maximum -- a ramp, not random noise.
-void warm_up_device(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C) {
-    std::printf("Warming up GPU to steady-state clocks... ");
+// The budget is wall-clock time, not a fixed number of launches. A fixed count
+// warms for very different durations depending on matrix size -- 300 launches is
+// about 20 ms at N=256 but about 700 ms at N=1024 -- so a size sweep would time
+// its small cases before the GPU had sped up, while believing it had warmed up.
+void warm_up_device(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
+                    double seconds = 1.5) {
+    std::printf("Warming up GPU to steady-state clocks (%.1fs)... ", seconds);
     std::fflush(stdout);
-    for (int i = 0; i < 300; ++i) {
-        fn(A, B, C);
+
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::duration<double>(seconds);
+    long long launches = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        // Batch between clock checks so the timing query is not itself the
+        // dominant cost for small matrices.
+        for (int i = 0; i < 20; ++i) {
+            fn(A, B, C);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        launches += 20;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    std::printf("done\n");
+    std::printf("done (%lld launches)\n", launches);
 }
 
 struct Result {
@@ -124,13 +134,13 @@ struct Result {
 // Runs the timing loop `reps` independent times and reports the distribution.
 //
 // A single measurement is not trustworthy on shared or thermally-constrained
-// hardware: clocks boost and throttle, and on a cloud GPU you may not even get
-// the same physical card between sessions. Reporting one number invites you to
-// draw conclusions from noise.
+// hardware: clocks rise and fall, and on a cloud GPU you may not even get the
+// same physical card between sessions. Reporting one number invites you to draw
+// conclusions from noise.
 //
-// The median resists an occasional throttled outlier in a way the mean does not,
-// and printing the spread makes it obvious when the difference between two
-// kernels is smaller than the measurement error.
+// The median resists an occasional slow outlier in a way the mean does not, and
+// printing the spread makes it obvious when the difference between two kernels
+// is smaller than the measurement error.
 Result evaluate(const char* name, GemmFn fn,
                 const Tensor& dA, const Tensor& dB, Tensor& dC,
                 const std::vector<float>& cpu_result,
@@ -207,8 +217,8 @@ int main(int argc, char** argv) {
     gemm_cpu_reference(hA, hB, cpu_result, M, N, K);
     std::printf("done\n");
 
-    // Must happen before any timing, and with the *same* kernel for every run,
-    // so that no kernel gets to free-ride on another's warm-up.
+    // Must happen before any timing, and with the same kernel every run, so no
+    // kernel gets to free-ride on another's warm-up.
     warm_up_device(gemm_tiled, dA, dB, dC);
 
     const int iters = 50;
