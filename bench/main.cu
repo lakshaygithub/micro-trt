@@ -91,6 +91,26 @@ float time_kernel_ms(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
     return total_ms / static_cast<float>(iters);
 }
 
+// Drives the GPU under sustained load until its clocks reach steady state.
+//
+// GPUs idle at a low clock and boost when work arrives, and the ramp takes
+// noticeably longer than a single kernel launch. Without this, the first
+// measurements are taken mid-ramp: they look slow, and whichever kernel happens
+// to run first is unfairly penalised while later kernels benefit from the
+// warm-up it paid for.
+//
+// The symptom to recognise is a median that sits almost on top of the minimum
+// with a long tail toward the maximum -- a ramp, not random noise.
+void warm_up_device(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C) {
+    std::printf("Warming up GPU to steady-state clocks... ");
+    std::fflush(stdout);
+    for (int i = 0; i < 300; ++i) {
+        fn(A, B, C);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::printf("done\n");
+}
+
 struct Result {
     const char* name;
     float median_ms;
@@ -186,6 +206,10 @@ int main(int argc, char** argv) {
     std::vector<float> cpu_result(static_cast<std::size_t>(M) * N);
     gemm_cpu_reference(hA, hB, cpu_result, M, N, K);
     std::printf("done\n");
+
+    // Must happen before any timing, and with the *same* kernel for every run,
+    // so that no kernel gets to free-ride on another's warm-up.
+    warm_up_device(gemm_tiled, dA, dB, dC);
 
     const int iters = 50;
     std::printf("Timing: median of %d reps x %d iterations each\n\n", reps, iters);
