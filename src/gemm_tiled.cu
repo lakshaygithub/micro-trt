@@ -11,7 +11,7 @@ namespace {
 //   TILE=16 -> 2 KB   TILE=32 -> 8 KB
 // The T4 has 64 KB of shared memory per SM, so at 16 this is not the limit on
 // how many blocks can be resident.
-constexpr int TILE = 32;
+constexpr int TILE = 16;
 
 __global__ void gemm_tiled_kernel(const float* __restrict__ A,
                                   const float* __restrict__ B,

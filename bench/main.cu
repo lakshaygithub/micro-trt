@@ -7,6 +7,7 @@
 #include <vector>
 #include <random>
 #include <string>
+#include <algorithm>
 
 namespace {
 
@@ -57,7 +58,7 @@ std::vector<float> random_matrix(int rows, int cols, std::mt19937& rng) {
     return out;
 }
 
-// Times any kernel matching GemmFn, using CUDA events rather than a CPU clock.
+// Times a kernel with CUDA events rather than a CPU clock.
 //
 // Why events: kernel launches are asynchronous. A CPU timer around the launch
 // measures how long it took to *queue* the work, which is meaningless. Events
@@ -92,26 +93,49 @@ float time_kernel_ms(GemmFn fn, const Tensor& A, const Tensor& B, Tensor& C,
 
 struct Result {
     const char* name;
-    float ms;
-    double gflops;
+    float median_ms;
+    float min_ms;
+    float max_ms;
+    double median_gflops;
+    double spread_pct;  // (max - min) / median, as a percentage
     bool correct;
 };
 
+// Runs the timing loop `reps` independent times and reports the distribution.
+//
+// A single measurement is not trustworthy on shared or thermally-constrained
+// hardware: clocks boost and throttle, and on a cloud GPU you may not even get
+// the same physical card between sessions. Reporting one number invites you to
+// draw conclusions from noise.
+//
+// The median resists an occasional throttled outlier in a way the mean does not,
+// and printing the spread makes it obvious when the difference between two
+// kernels is smaller than the measurement error.
 Result evaluate(const char* name, GemmFn fn,
                 const Tensor& dA, const Tensor& dB, Tensor& dC,
                 const std::vector<float>& cpu_result,
-                int M, int N, int K, int iters) {
+                int M, int N, int K, int iters, int reps) {
     // Correctness first, always.
     fn(dA, dB, dC);
     CUDA_CHECK(cudaDeviceSynchronize());
     const bool ok = allclose(dC.download(), cpu_result, 1e-3f);
 
-    const float ms = time_kernel_ms(fn, dA, dB, dC, iters);
+    std::vector<float> samples;
+    samples.reserve(reps);
+    for (int r = 0; r < reps; ++r) {
+        samples.push_back(time_kernel_ms(fn, dA, dB, dC, iters));
+    }
+    std::sort(samples.begin(), samples.end());
+
+    const float median_ms = samples[samples.size() / 2];
+    const float min_ms = samples.front();
+    const float max_ms = samples.back();
 
     const double flops = 2.0 * M * N * K;  // one multiply + one add per MAC
-    const double gflops = (flops / (ms / 1000.0)) / 1e9;
+    const double median_gflops = (flops / (median_ms / 1000.0)) / 1e9;
+    const double spread_pct = 100.0 * (max_ms - min_ms) / median_ms;
 
-    return Result{name, ms, gflops, ok};
+    return Result{name, median_ms, min_ms, max_ms, median_gflops, spread_pct, ok};
 }
 
 void print_device_info() {
@@ -131,16 +155,21 @@ void print_device_info() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // usage: ./bench_gemm [size] [reps]
     int size = 1024;
+    int reps = 7;  // odd, so the median is an actual sample
     if (argc > 1) {
         size = std::stoi(argv[1]);
+    }
+    if (argc > 2) {
+        reps = std::stoi(argv[2]);
     }
     const int M = size;
     const int N = size;
     const int K = size;
 
     print_device_info();
-    std::printf("GEMM: (%d x %d) * (%d x %d)\n\n", M, K, K, N);
+    std::printf("GEMM: (%d x %d) * (%d x %d)\n", M, K, K, N);
 
     std::mt19937 rng(42);  // fixed seed -> reproducible runs
     const std::vector<float> hA = random_matrix(M, K, rng);
@@ -156,25 +185,35 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     std::vector<float> cpu_result(static_cast<std::size_t>(M) * N);
     gemm_cpu_reference(hA, hB, cpu_result, M, N, K);
-    std::printf("done\n\n");
+    std::printf("done\n");
 
-    const int iters = 20;
+    const int iters = 50;
+    std::printf("Timing: median of %d reps x %d iterations each\n\n", reps, iters);
+
     const Result results[] = {
-        evaluate("gemm_naive", gemm_naive, dA, dB, dC, cpu_result, M, N, K, iters),
-        evaluate("gemm_tiled", gemm_tiled, dA, dB, dC, cpu_result, M, N, K, iters),
+        evaluate("gemm_naive", gemm_naive, dA, dB, dC, cpu_result, M, N, K, iters, reps),
+        evaluate("gemm_tiled", gemm_tiled, dA, dB, dC, cpu_result, M, N, K, iters, reps),
     };
 
-    std::printf("%-14s %10s %14s %10s %8s\n",
-                "kernel", "time (ms)", "GFLOP/s", "vs naive", "correct");
-    std::printf("--------------------------------------------------------------\n");
+    std::printf("%-14s %11s %14s %9s %8s %8s\n",
+                "kernel", "median ms", "GFLOP/s", "vs naive", "spread", "correct");
+    std::printf("-----------------------------------------------------------------------\n");
 
-    const double baseline_ms = results[0].ms;
+    const double baseline_ms = results[0].median_ms;
     for (const Result& r : results) {
-        std::printf("%-14s %10.3f %14.2f %9.2fx %8s\n",
-                    r.name, r.ms, r.gflops,
-                    baseline_ms / r.ms,
+        std::printf("%-14s %11.3f %14.2f %8.2fx %7.1f%% %8s\n",
+                    r.name, r.median_ms, r.median_gflops,
+                    baseline_ms / r.median_ms,
+                    r.spread_pct,
                     r.correct ? "yes" : "NO");
     }
+
+    std::printf("\nmin/max per kernel:\n");
+    for (const Result& r : results) {
+        std::printf("  %-14s %.3f .. %.3f ms\n", r.name, r.min_ms, r.max_ms);
+    }
+    std::printf("\nIf spread exceeds the difference between two kernels,\n"
+                "that difference is measurement noise, not a result.\n");
 
     // Every kernel must be correct; a fast wrong answer is a failure.
     for (const Result& r : results) {
