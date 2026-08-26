@@ -225,8 +225,9 @@ int main(int argc, char** argv) {
     std::printf("Timing: median of %d reps x %d iterations each\n\n", reps, iters);
 
     const Result results[] = {
-        evaluate("gemm_naive", gemm_naive, dA, dB, dC, cpu_result, M, N, K, iters, reps),
-        evaluate("gemm_tiled", gemm_tiled, dA, dB, dC, cpu_result, M, N, K, iters, reps),
+        evaluate("gemm_naive",    gemm_naive,    dA, dB, dC, cpu_result, M, N, K, iters, reps),
+        evaluate("gemm_tiled",    gemm_tiled,    dA, dB, dC, cpu_result, M, N, K, iters, reps),
+        evaluate("gemm_regtiled", gemm_regtiled, dA, dB, dC, cpu_result, M, N, K, iters, reps),
     };
 
     std::printf("%-14s %11s %14s %9s %8s %8s\n",

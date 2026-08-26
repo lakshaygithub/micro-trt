@@ -10,7 +10,8 @@ ARCH      ?= sm_75
 NVCC_FLAGS := -std=c++17 -O3 -arch=$(ARCH) -Iinclude -lineinfo \
               -Wno-deprecated-gpu-targets
 
-SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu bench/main.cu
+SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu src/gemm_regtiled.cu \
+        bench/main.cu
 BIN  := bench_gemm
 
 .PHONY: all clean run

@@ -19,3 +19,8 @@ void gemm_naive(const Tensor& A, const Tensor& B, Tensor& C);
 // v2: same work, staged through shared memory in TILE x TILE blocks. Cuts global
 // memory traffic by a factor of TILE.
 void gemm_tiled(const Tensor& A, const Tensor& B, Tensor& C);
+
+// v3: adds register blocking on top of shared-memory tiling. Each thread
+// computes a 4x4 patch of C held in registers, cutting the inner loop from
+// 2 shared-memory loads per multiply-add down to 0.5.
+void gemm_regtiled(const Tensor& A, const Tensor& B, Tensor& C);
