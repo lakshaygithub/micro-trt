@@ -10,19 +10,26 @@ ARCH      ?= sm_75
 NVCC_FLAGS := -std=c++17 -O3 -arch=$(ARCH) -Iinclude -lineinfo \
               -Wno-deprecated-gpu-targets
 
-SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu src/gemm_regtiled.cu \
-        bench/main.cu
-BIN  := bench_gemm
+LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
+            src/gemm_regtiled.cu src/bias_relu.cu
 
-.PHONY: all clean run
+BINS := bench_gemm bench_fusion
 
-all: $(BIN)
+.PHONY: all clean run run-fusion
 
-$(BIN): $(SRCS)
-	$(NVCC) $(NVCC_FLAGS) $(SRCS) -o $(BIN)
+all: $(BINS)
 
-run: $(BIN)
-	./$(BIN)
+bench_gemm: $(LIB_SRCS) bench/main.cu
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/main.cu -o $@
+
+bench_fusion: $(LIB_SRCS) bench/bench_fusion.cu
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/bench_fusion.cu -o $@
+
+run: bench_gemm
+	./bench_gemm
+
+run-fusion: bench_fusion
+	./bench_fusion
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BINS)
