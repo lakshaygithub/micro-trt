@@ -143,17 +143,36 @@ void print_device_info() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    int size = 1024;
+    // usage:
+    //   ./bench_fusion                  -> 1024^3, 15 reps
+    //   ./bench_fusion N                -> N^3
+    //   ./bench_fusion M N K            -> rectangular
+    //   ./bench_fusion M N K reps
+    //
+    // Rectangular shapes matter here: fusion eliminates traffic proportional to
+    // the output (M*N) while the GEMM itself costs M*N*K. Shrinking K makes the
+    // multiply cheaper without shrinking the epilogue, which is exactly the
+    // regime real inference layers live in.
+    int M = 1024, N = 1024, K = 1024;
     int reps = 15;
-    if (argc > 1) size = std::stoi(argv[1]);
-    if (argc > 2) reps = std::stoi(argv[2]);
 
-    const int M = size;
-    const int N = size;
-    const int K = size;
+    if (argc == 2) {
+        M = N = K = std::stoi(argv[1]);
+    } else if (argc >= 4) {
+        M = std::stoi(argv[1]);
+        N = std::stoi(argv[2]);
+        K = std::stoi(argv[3]);
+        if (argc > 4) reps = std::stoi(argv[4]);
+    } else if (argc == 3) {
+        M = N = K = std::stoi(argv[1]);
+        reps = std::stoi(argv[2]);
+    }
 
     print_device_info();
     std::printf("Y = ReLU(A*B + bias),  A(%d x %d) * B(%d x %d)\n", M, K, K, N);
+    std::printf("Arithmetic: %.2f GFLOP | Output: %.1f MB\n",
+                2.0 * M * N * K / 1e9,
+                static_cast<double>(M) * N * sizeof(float) / (1024.0 * 1024.0));
 
     std::mt19937 rng(42);
     const std::vector<float> hA = random_vector(static_cast<std::size_t>(M) * K, rng);
@@ -211,8 +230,17 @@ int main(int argc, char** argv) {
     std::printf("\nGlobal traffic avoided: %.1f MB per call\n",
                 bytes_saved / (1024.0 * 1024.0));
     if (saved_ms > 0.0) {
+        const double implied_gbs = (bytes_saved / (saved_ms / 1000.0)) / 1e9;
         std::printf("Time saved: %.4f ms  (implied bandwidth %.0f GB/s)\n",
-                    saved_ms, (bytes_saved / (saved_ms / 1000.0)) / 1e9);
+                    saved_ms, implied_gbs);
+        // An implied figure above the card's DRAM bandwidth means the output
+        // was still resident in L2 when the second pass read it, so the
+        // eliminated kernel never reached DRAM. Fusion is worth more once the
+        // output no longer fits in cache.
+        if (implied_gbs > 320.0) {
+            std::printf("  (above DRAM peak -- output was still L2-resident, "
+                        "so this understates fusion's value)\n");
+        }
     }
 
     for (const Result& r : results) {
