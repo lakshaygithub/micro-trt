@@ -15,12 +15,12 @@ namespace {
 //   this kernel      -> (TM + TN) shared loads per (TM * TN) FMAs
 //                     = 8 loads per 16 FMAs = 0.5 loads per FMA, a 4x drop.
 // ---------------------------------------------------------------------------
-constexpr int BM = 64;  // block tile rows of C
-constexpr int BN = 64;  // block tile cols of C
+constexpr int BM = 128;  // block tile rows of C
+constexpr int BN = 128;  // block tile cols of C
 constexpr int BK = 16;  // depth of the K slab staged per iteration
 
-constexpr int TM = 4;   // per-thread rows
-constexpr int TN = 4;   // per-thread cols
+constexpr int TM = 8;   // per-thread rows
+constexpr int TN = 8;   // per-thread cols
 
 constexpr int THREADS = (BM / TM) * (BN / TN);  // 16 * 16 = 256
 
