@@ -201,7 +201,7 @@ void softmax_block_kernel(const float* __restrict__ X,
 __device__ __forceinline__ void combine_online(float& m, float& s,
                                                float m_other, float s_other) {
     const float m_new = fmaxf(m, m_other);
-    s = s * __expf(m - m_new) + s_other * __expf(m_other - m_new);
+    s = s * expf(m - m_new) + s_other * expf(m_other - m_new);
     m = m_new;
 }
 
@@ -267,7 +267,7 @@ void softmax_online_kernel(const float* __restrict__ X,
 
     const float inv = 1.0f / s;
     for (int j = threadIdx.x; j < N; j += BLOCK) {
-        yr[j] = __expf(xr[j] - m) * inv;
+        yr[j] = expf(xr[j] - m) * inv;
     }
 }
 
