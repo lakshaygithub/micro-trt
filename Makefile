@@ -11,11 +11,11 @@ NVCC_FLAGS := -std=c++17 -O3 -arch=$(ARCH) -Iinclude -lineinfo \
               -Wno-deprecated-gpu-targets
 
 LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
-            src/gemm_regtiled.cu src/bias_relu.cu
+            src/gemm_regtiled.cu src/bias_relu.cu src/softmax.cu
 
-BINS := bench_gemm bench_fusion
+BINS := bench_gemm bench_fusion bench_softmax
 
-.PHONY: all clean run run-fusion
+.PHONY: all clean run run-fusion run-softmax
 
 all: $(BINS)
 
@@ -25,11 +25,17 @@ bench_gemm: $(LIB_SRCS) bench/main.cu
 bench_fusion: $(LIB_SRCS) bench/bench_fusion.cu
 	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/bench_fusion.cu -o $@
 
+bench_softmax: $(LIB_SRCS) bench/bench_softmax.cu
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/bench_softmax.cu -o $@
+
 run: bench_gemm
 	./bench_gemm
 
 run-fusion: bench_fusion
 	./bench_fusion
+
+run-softmax: bench_softmax
+	./bench_softmax
 
 clean:
 	rm -f $(BINS)

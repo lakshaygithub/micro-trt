@@ -43,3 +43,29 @@ void bias_relu_inplace(Tensor& C, const Tensor& bias);
 // Fused: C = ReLU(A * B + bias), in a single kernel with a single pass over C.
 void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
                           const Tensor& bias, Tensor& C);
+
+// ---------------------------------------------------------------------------
+// Row-wise softmax:  Y[r][c] = exp(X[r][c] - max_r) / sum_c exp(X[r][c] - max_r)
+//
+// Unlike GEMM, this is memory-bound: it touches every element twice and does
+// almost no arithmetic, so the metric that matters is achieved bandwidth rather
+// than FLOP/s.
+//
+// It also needs something none of the GEMM kernels did -- threads cooperating
+// to compute a value (the row max, the row sum) that spans the whole row.
+// ---------------------------------------------------------------------------
+
+using UnaryFn = void (*)(const Tensor& X, Tensor& Y);
+
+// v1: one thread per row. Three passes over the row, and badly uncoalesced --
+// threads in a warp read addresses N floats apart.
+void softmax_naive(const Tensor& X, Tensor& Y);
+
+// v2: one block per row. Coalesced access, with the max and sum computed by
+// block-wide reductions built on warp shuffles. Still three passes.
+void softmax_block(const Tensor& X, Tensor& Y);
+
+// v3: online (single-pass) reduction. Tracks the running max and running sum
+// together, rescaling the sum whenever the max changes, so the statistics need
+// one pass instead of two. Same recurrence FlashAttention is built on.
+void softmax_online(const Tensor& X, Tensor& Y);
