@@ -44,6 +44,12 @@ void bias_relu_inplace(Tensor& C, const Tensor& bias);
 void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
                           const Tensor& bias, Tensor& C);
 
+// Fused: C = A * B + bias, with no activation. Needed for the output layer of a
+// classifier, where a softmax follows and ReLU would clamp away the negative
+// logits it operates on.
+void gemm_bias(const Tensor& A, const Tensor& B,
+               const Tensor& bias, Tensor& C);
+
 // ---------------------------------------------------------------------------
 // Row-wise softmax:  Y[r][c] = exp(X[r][c] - max_r) / sum_c exp(X[r][c] - max_r)
 //

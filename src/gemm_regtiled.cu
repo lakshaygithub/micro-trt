@@ -62,6 +62,21 @@ struct BiasRelu {
     }
 };
 
+// Y = A*B + bias, no activation. Needed for the final layer of a classifier,
+// where a softmax follows and applying ReLU first would destroy the negative
+// logits it depends on.
+//
+// Note what adding this variant cost: one struct, and one more instantiation
+// at the bottom of the file. No kernel was duplicated. That is the payoff of
+// templating the epilogue rather than copy-pasting the kernel.
+struct BiasOnly {
+    const float* __restrict__ bias;
+
+    __device__ __forceinline__ float operator()(float v, int col) const {
+        return v + bias[col];
+    }
+};
+
 template <typename Epilogue>
 __global__ __launch_bounds__(THREADS)
 void gemm_regtiled_kernel(const float* __restrict__ A,
@@ -201,4 +216,9 @@ void gemm_regtiled(const Tensor& A, const Tensor& B, Tensor& C) {
 void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
                           const Tensor& bias, Tensor& C) {
     launch(A, B, C, BiasRelu{bias.data()});
+}
+
+void gemm_bias(const Tensor& A, const Tensor& B,
+               const Tensor& bias, Tensor& C) {
+    launch(A, B, C, BiasOnly{bias.data()});
 }

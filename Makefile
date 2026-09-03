@@ -11,11 +11,11 @@ NVCC_FLAGS := -std=c++17 -O3 -arch=$(ARCH) -Iinclude -lineinfo \
               -Wno-deprecated-gpu-targets
 
 LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
-            src/gemm_regtiled.cu src/bias_relu.cu src/softmax.cu
+            src/gemm_regtiled.cu src/bias_relu.cu src/softmax.cu src/mlp.cu
 
-BINS := bench_gemm bench_fusion bench_softmax
+BINS := bench_gemm bench_fusion bench_softmax bench_mlp
 
-.PHONY: all clean run run-fusion run-softmax
+.PHONY: all clean run run-fusion run-softmax run-mlp compare
 
 all: $(BINS)
 
@@ -28,6 +28,9 @@ bench_fusion: $(LIB_SRCS) bench/bench_fusion.cu
 bench_softmax: $(LIB_SRCS) bench/bench_softmax.cu
 	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/bench_softmax.cu -o $@
 
+bench_mlp: $(LIB_SRCS) bench/bench_mlp.cu
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) bench/bench_mlp.cu -o $@
+
 run: bench_gemm
 	./bench_gemm
 
@@ -37,5 +40,13 @@ run-fusion: bench_fusion
 run-softmax: bench_softmax
 	./bench_softmax
 
+run-mlp: bench_mlp
+	./bench_mlp
+
+# Runs the forward pass, then verifies it against PyTorch on the same GPU.
+compare: bench_mlp
+	./bench_mlp
+	python3 tools/compare_pytorch.py
+
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) mlp_dump.bin
