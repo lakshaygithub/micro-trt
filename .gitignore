@@ -8,5 +8,6 @@ bench_gemm
 .DS_Store
 build/
 check_qwen
+check_qwen_gpu
 models/
 __pycache__/

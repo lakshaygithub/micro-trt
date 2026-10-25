@@ -1,6 +1,7 @@
 #include "kernels.h"
 #include "tensor.h"
 #include "cuda_utils.h"
+#include "reduce.cuh"
 
 #include <cfloat>
 
@@ -12,38 +13,9 @@ constexpr int NWARPS = BLOCK / 32;   // 8
 static_assert(BLOCK % 32 == 0, "block must be a whole number of warps");
 
 // ---------------------------------------------------------------------------
-// Warp-level reductions
-//
-// A warp is 32 threads executing in lockstep, and they can exchange register
-// values directly with each other -- no shared memory, no barrier. That is what
-// __shfl_xor_sync does: every thread swaps its value with the thread whose lane
-// index differs in one bit, given by `offset`.
-//
-// Five rounds of this (offsets 16, 8, 4, 2, 1) is a butterfly pattern that
-// leaves the fully reduced result in EVERY lane, which saves a separate
-// broadcast step. The 0xffffffff mask says all 32 lanes participate.
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ float warp_reduce_max(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
-    }
-    return v;
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        v += __shfl_xor_sync(0xffffffffu, v, off);
-    }
-    return v;
-}
-
-// ---------------------------------------------------------------------------
 // Block-level reductions
 //
-// Two stages: reduce within each warp using shuffles, then have one thread per
+// Two stages: reduce within each warp using shuffles (reduce.cuh), then have one thread per
 // warp write its result to shared memory and let the first warp reduce those.
 //
 // `smem` must have room for NWARPS + 1 floats: NWARPS staging slots plus one

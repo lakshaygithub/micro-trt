@@ -10,6 +10,8 @@
 // Usage:  ./check_qwen [weights_prefix] [reference_prefix]
 //         defaults: models/qwen  models/ref
 
+#include "qwen_config.h"
+#include "reference_check.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -21,11 +23,6 @@
 namespace {
 
 using Mat = std::vector<float>;  // row-major; shape tracked by the caller
-
-struct Config {
-    int hidden, layers, heads, kv_heads, head_dim, intermediate, vocab;
-    double rope_theta, rms_eps;
-};
 
 // y = x * W (+ b).  x is (T x K), W is (K x N) -- already transposed at export.
 Mat linear(const Mat& x, int T, int K, const Mat& W, int N, const Mat* b = nullptr) {
@@ -121,33 +118,6 @@ Mat attention(const Mat& q, const Mat& k, const Mat& v, int T,
     return ctx;
 }
 
-// Error is reported relative to the largest magnitude in the reference rather
-// than elementwise: a per-element relative error explodes on values near zero
-// and would fail correct code. Qwen's residual stream also carries a few very
-// large outlier channels, so this is the scale a reader of the numbers cares
-// about.
-constexpr double kTolerance = 1e-4;
-int g_failures = 0;
-
-void compare(const WeightFile& ref, const std::string& name, const Mat& got) {
-    const Mat want = ref.host(name);
-    if (want.size() != got.size()) {
-        std::printf("  %-18s SHAPE MISMATCH (%zu vs %zu)\n", name.c_str(), got.size(), want.size());
-        ++g_failures;
-        return;
-    }
-    double max_diff = 0.0, max_ref = 0.0;
-    for (std::size_t i = 0; i < got.size(); ++i) {
-        max_diff = std::max(max_diff, std::fabs(static_cast<double>(got[i]) - want[i]));
-        max_ref = std::max(max_ref, std::fabs(static_cast<double>(want[i])));
-    }
-    const double rel = max_diff / std::max(max_ref, 1e-12);
-    const bool ok = rel < kTolerance;
-    if (!ok) ++g_failures;
-    std::printf("  %-18s max|diff| %.3e   max|ref| %9.3f   rel %.2e   %s\n",
-                name.c_str(), max_diff, max_ref, rel, ok ? "ok" : "FAIL");
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -155,21 +125,12 @@ int main(int argc, char** argv) {
     const std::string rprefix = argc > 2 ? argv[2] : "models/ref";
     const WeightFile W(wprefix);
     const WeightFile R(rprefix);
+    ReferenceCheck check(R);
 
-    Config c{};
-    c.hidden = static_cast<int>(W.config("hidden"));
-    c.layers = static_cast<int>(W.config("layers"));
-    c.heads = static_cast<int>(W.config("heads"));
-    c.kv_heads = static_cast<int>(W.config("kv_heads"));
-    c.head_dim = static_cast<int>(W.config("head_dim"));
-    c.intermediate = static_cast<int>(W.config("intermediate"));
-    c.vocab = static_cast<int>(W.config("vocab"));
-    c.rope_theta = W.config("rope_theta");
-    c.rms_eps = W.config("rms_eps");
-
+    const QwenConfig c = QwenConfig::from(W);
     const int H = c.hidden;
-    const int QD = c.heads * c.head_dim;
-    const int KVD = c.kv_heads * c.head_dim;
+    const int QD = c.q_dim();
+    const int KVD = c.kv_dim();
     const int I = c.intermediate;
 
     std::printf("Qwen2: %d layers, hidden %d, %d/%d heads, head_dim %d, ffn %d, vocab %d\n",
@@ -179,7 +140,7 @@ int main(int argc, char** argv) {
     auto expect = [&](const std::string& n, int r, int cl) {
         if (!W.has(n) || W.rows(n) != r || W.cols(n) != cl) {
             std::printf("  weight %s: expected %d x %d\n", n.c_str(), r, cl);
-            ++g_failures;
+            check.record_failure();
         }
     };
     expect("embed", c.vocab, H);
@@ -197,7 +158,7 @@ int main(int argc, char** argv) {
         expect(L + "w_up", H, I);
         expect(L + "w_down", I, H);
     }
-    std::printf("Weight shapes: %s\n\n", g_failures ? "MISMATCH" : "all as expected");
+    std::printf("Weight shapes: %s\n\n", check.failures() ? "MISMATCH" : "all as expected");
 
     const std::vector<int>& tokens = R.ints("tokens");
     const int T = static_cast<int>(tokens.size());
@@ -211,7 +172,7 @@ int main(int argc, char** argv) {
             std::copy_n(&embed[static_cast<std::size_t>(tokens[t]) * H], H,
                         &x[static_cast<std::size_t>(t) * H]);
     }
-    compare(R, "embed_out", x);
+    check.compare("embed_out", x);
 
     for (int l = 0; l < c.layers; ++l) {
         const std::string L = "L" + std::to_string(l) + ".";
@@ -219,43 +180,43 @@ int main(int argc, char** argv) {
 
         // Attention sub-block:  x = x + o_proj(attn(rope(q), rope(k), v))
         const Mat a = rmsnorm(x, T, H, W.host(L + "attn_norm"), c.rms_eps);
-        if (detail) compare(R, "L0.attn_norm_out", a);
+        if (detail) check.compare("L0.attn_norm_out", a);
 
         const Mat bq = W.host(L + "bq"), bk = W.host(L + "bk"), bv = W.host(L + "bv");
         Mat q = linear(a, T, H, W.host(L + "wq"), QD, &bq);
         Mat k = linear(a, T, H, W.host(L + "wk"), KVD, &bk);
         const Mat v = linear(a, T, H, W.host(L + "wv"), KVD, &bv);
-        if (detail) { compare(R, "L0.q", q); compare(R, "L0.k", k); compare(R, "L0.v", v); }
+        if (detail) { check.compare("L0.q", q); check.compare("L0.k", k); check.compare("L0.v", v); }
 
         rope(q, T, c.heads, c.head_dim, c.rope_theta);
         rope(k, T, c.kv_heads, c.head_dim, c.rope_theta);
-        if (detail) { compare(R, "L0.q_rope", q); compare(R, "L0.k_rope", k); }
+        if (detail) { check.compare("L0.q_rope", q); check.compare("L0.k_rope", k); }
 
         const Mat ctx = attention(q, k, v, T, c.heads, c.kv_heads, c.head_dim);
-        if (detail) compare(R, "L0.attn_ctx", ctx);
+        if (detail) check.compare("L0.attn_ctx", ctx);
 
         const Mat o = linear(ctx, T, QD, W.host(L + "wo"), H);
-        if (detail) compare(R, "L0.attn_out", o);
+        if (detail) check.compare("L0.attn_out", o);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += o[i];
 
         // MLP sub-block:  x = x + down(silu(gate(m)) * up(m))   -- SwiGLU
         const Mat m = rmsnorm(x, T, H, W.host(L + "mlp_norm"), c.rms_eps);
-        if (detail) compare(R, "L0.mlp_norm_out", m);
+        if (detail) check.compare("L0.mlp_norm_out", m);
 
         Mat g = linear(m, T, H, W.host(L + "w_gate"), I);
         const Mat u = linear(m, T, H, W.host(L + "w_up"), I);
         for (std::size_t i = 0; i < g.size(); ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
         const Mat d = linear(g, T, I, W.host(L + "w_down"), H);
-        if (detail) compare(R, "L0.mlp_out", d);
+        if (detail) check.compare("L0.mlp_out", d);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] += d[i];
 
-        compare(R, L + "out", x);
+        check.compare(L + "out", x);
     }
 
     const Mat f = rmsnorm(x, T, H, W.host("final_norm"), c.rms_eps);
-    compare(R, "final_norm_out", f);
+    check.compare("final_norm_out", f);
     const Mat logits = linear(f, T, H, W.host("lm_head"), c.vocab);
-    compare(R, "logits", logits);
+    check.compare("logits", logits);
 
     // The prediction for the token after the prompt is the argmax of the last
     // row -- which must be the first token Hugging Face generated greedily.
@@ -263,9 +224,10 @@ int main(int argc, char** argv) {
     const int next = static_cast<int>(std::max_element(last, last + c.vocab) - last);
     const int hf_next = R.ints("generated").front();
     const bool next_ok = (next == hf_next);
-    if (!next_ok) ++g_failures;
+    if (!next_ok) check.record_failure();
     std::printf("\nNext token: %d (Hugging Face: %d)  %s\n", next, hf_next, next_ok ? "ok" : "FAIL");
 
-    std::printf("%s\n", g_failures ? "FAILED" : "CPU reference matches Hugging Face");
-    return g_failures ? 1 : 0;
+    std::printf("Worst relative error: %.2e (%s)\n", check.worst(), check.worst_name().c_str());
+    std::printf("%s\n", check.failures() ? "FAILED" : "CPU reference matches Hugging Face");
+    return check.failures() ? 1 : 0;
 }

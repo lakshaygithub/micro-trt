@@ -75,3 +75,36 @@ void softmax_block(const Tensor& X, Tensor& Y);
 // together, rescaling the sum whenever the max changes, so the statistics need
 // one pass instead of two. Same recurrence FlashAttention is built on.
 void softmax_online(const Tensor& X, Tensor& Y);
+
+// ---------------------------------------------------------------------------
+// Transformer building blocks (Qwen2 / Llama-family decoder)
+//
+// Each is the GPU counterpart of one function in tests/check_qwen.cpp, the CPU
+// forward pass that matches Hugging Face layer by layer and serves as their
+// specification. Activations are (tokens x features), one row per token.
+// ---------------------------------------------------------------------------
+
+// out[t] = table[tokens[t]] for every row t of out. `d_tokens` is a device
+// array of out.rows() ids, already checked by the caller to be < table.rows().
+void embedding_lookup(const Tensor& table, const int* d_tokens, Tensor& out);
+
+// RMSNorm, per row: y = x / sqrt(mean(x^2) + eps) * weight. weight is 1 x cols.
+void rmsnorm(const Tensor& x, const Tensor& weight, float eps, Tensor& y);
+
+// Rotary position embedding, in place. x is (T x n_heads*head_dim), and row t
+// is the token at position pos + t. inv_freq is 1 x head_dim/2.
+void rope_inplace(Tensor& x, int n_heads, int pos, const Tensor& inv_freq);
+
+// Causal grouped-query attention over a KV cache.
+//   q:                (T x heads*head_dim), row t at position pos + t
+//   k_cache, v_cache: (max_seq x kv_heads*head_dim), rows 0 .. pos+T-1 filled
+//   out:              (T x heads*head_dim)
+// Each query attends to every cached position up to and including its own.
+void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
+               int pos, int heads, int kv_heads, Tensor& out);
+
+// gate = silu(gate) * up, elementwise: the SwiGLU activation of the MLP.
+void silu_mul_inplace(Tensor& gate, const Tensor& up);
+
+// x += y, elementwise: a residual connection.
+void add_inplace(Tensor& x, const Tensor& y);

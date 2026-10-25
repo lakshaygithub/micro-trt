@@ -15,7 +15,7 @@ LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
 
 BINS := bench_gemm bench_fusion bench_softmax bench_mlp
 
-.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen
+.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen check-qwen-gpu
 
 all: $(BINS)
 
@@ -53,17 +53,26 @@ compare: bench_mlp
 # transformers; ~2.5 GB written to models/), then check the CPU reference
 # forward pass against them layer by layer.
 QWEN_MODEL ?= Qwen/Qwen2.5-0.5B
+QWEN_SRCS  := src/weights.cpp src/transformer.cu src/qwen.cu
 
 qwen-files:
 	python3 tools/export_qwen.py $(QWEN_MODEL) models/qwen
 	python3 tools/dump_reference.py $(QWEN_MODEL) models/ref
 
 # Host-only: builds and runs without a GPU.
-check_qwen: src/weights.cpp tests/check_qwen.cpp include/weights.h
+check_qwen: src/weights.cpp tests/check_qwen.cpp tests/reference_check.h include/qwen_config.h
 	$(NVCC) -std=c++17 -O3 -Iinclude src/weights.cpp tests/check_qwen.cpp -o $@
 
 check-qwen: check_qwen
 	./check_qwen models/qwen models/ref
 
+# The same checks against the GPU forward pass, plus a full greedy decode
+# through the KV cache compared token for token.
+check_qwen_gpu: $(LIB_SRCS) $(QWEN_SRCS) tests/check_qwen_gpu.cu tests/reference_check.h
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) $(QWEN_SRCS) tests/check_qwen_gpu.cu -o $@
+
+check-qwen-gpu: check_qwen_gpu
+	./check_qwen_gpu models/qwen models/ref
+
 clean:
-	rm -f $(BINS) check_qwen mlp_dump.bin
+	rm -f $(BINS) check_qwen check_qwen_gpu mlp_dump.bin

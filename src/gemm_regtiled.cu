@@ -197,6 +197,8 @@ void launch(const Tensor& A, const Tensor& B, Tensor& C, Epilogue epilogue) {
     const int M = A.rows();
     const int K = A.cols();
     const int N = B.cols();
+    require(B.rows() == K && C.rows() == M && C.cols() == N,
+            "gemm: shapes must be A (M x K), B (K x N), C (M x N)");
 
     const dim3 block(BN / TN, BM / TM);   // (16, 16) = 256 threads
     const dim3 grid((N + BN - 1) / BN,
@@ -215,10 +217,14 @@ void gemm_regtiled(const Tensor& A, const Tensor& B, Tensor& C) {
 
 void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
                           const Tensor& bias, Tensor& C) {
+    require(bias.size() == static_cast<std::size_t>(B.cols()),
+            "gemm_bias_relu_fused: bias needs one entry per output column");
     launch(A, B, C, BiasRelu{bias.data()});
 }
 
 void gemm_bias(const Tensor& A, const Tensor& B,
                const Tensor& bias, Tensor& C) {
+    require(bias.size() == static_cast<std::size_t>(B.cols()),
+            "gemm_bias: bias needs one entry per output column");
     launch(A, B, C, BiasOnly{bias.data()});
 }
