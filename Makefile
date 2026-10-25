@@ -15,7 +15,7 @@ LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
 
 BINS := bench_gemm bench_fusion bench_softmax bench_mlp
 
-.PHONY: all clean run run-fusion run-softmax run-mlp compare
+.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen
 
 all: $(BINS)
 
@@ -48,5 +48,22 @@ compare: bench_mlp
 	./bench_mlp
 	python3 tools/compare_pytorch.py
 
+# ---- Qwen2.5-0.5B ----------------------------------------------------------
+# Export the weights and record Hugging Face's activations (needs torch +
+# transformers; ~2.5 GB written to models/), then check the CPU reference
+# forward pass against them layer by layer.
+QWEN_MODEL ?= Qwen/Qwen2.5-0.5B
+
+qwen-files:
+	python3 tools/export_qwen.py $(QWEN_MODEL) models/qwen
+	python3 tools/dump_reference.py $(QWEN_MODEL) models/ref
+
+# Host-only: builds and runs without a GPU.
+check_qwen: src/weights.cpp tests/check_qwen.cpp include/weights.h
+	$(NVCC) -std=c++17 -O3 -Iinclude src/weights.cpp tests/check_qwen.cpp -o $@
+
+check-qwen: check_qwen
+	./check_qwen models/qwen models/ref
+
 clean:
-	rm -f $(BINS) mlp_dump.bin
+	rm -f $(BINS) check_qwen mlp_dump.bin

@@ -7,3 +7,6 @@ bench_gemm
 *.qdrep
 .DS_Store
 build/
+check_qwen
+models/
+__pycache__/
