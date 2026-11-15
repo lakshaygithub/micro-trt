@@ -2,7 +2,7 @@
 
 A minimal CUDA inference engine written from scratch in C++17 — hand-written kernels, no cuBLAS, no cuDNN.
 
-It runs Qwen2.5-0.5B, a 494M-parameter language model, end to end on its own kernels. Its greedy output matches Hugging Face token for token, and it decodes 105 tokens/s on a Tesla T4: 65% of the fastest the card's memory bandwidth allows. Each stage is optimized against the GPU memory hierarchy and measured honestly along the way.
+It runs Qwen2.5-0.5B, a 494M-parameter language model, end to end on its own kernels. Its greedy output matches Hugging Face token for token, and it decodes 105 tokens/s on a Tesla T4 (65% of the fastest the card's memory bandwidth allows) and 199 tokens/s on an A100. Each stage is optimized against the GPU memory hierarchy and measured honestly along the way.
 
 ## Qwen2.5-0.5B, end to end
 
@@ -15,7 +15,8 @@ Both implementations are compared with Hugging Face on a 7-token prompt at 37 ch
 | Implementation | Worst relative error | Greedy tokens matching Hugging Face |
 |---|---:|---:|
 | CPU reference, `tests/check_qwen.cpp` | 6.3e-05 | first token |
-| GPU engine, `tests/check_qwen_gpu.cu` | 4.4e-05 | 32 / 32 |
+| GPU engine on a T4, `tests/check_qwen_gpu.cu` | 4.4e-05 | 32 / 32 |
+| GPU engine on an A100 | 3.3e-05 | 32 / 32 |
 
 Relative error is max |difference| ÷ max |reference| per tensor, and the pass threshold is 1e-3. That threshold was set from both sides. Correct code that only sums in a different order stays below 1e-4. Four real architecture bugs planted in the CPU reference (RoPE pairing adjacent dimensions instead of i and i + d/2, the wrong query-to-KV head mapping, a dropped key bias, attention scaled by 1/d instead of 1/√d) each miss by 45% to 99.7% at the first checkpoint they reach, and each changes the predicted token.
 
@@ -23,20 +24,22 @@ Relative error is max |difference| ÷ max |reference| per tensor, and the pass t
 
 Text is generated one token at a time, so during decode every projection multiplies a single row by a weight matrix. The register-tiled GEMM handles that correctly, but its 128-row tiles do 128 rows of work for the one row that exists. `src/gemv.cu` is built for this shape instead:
 
-| Decode path | ms / token | tokens / s | Weight bandwidth | % of 320 GB/s | Spread |
-|---|---:|---:|---:|---:|---:|
-| Register-tiled GEMM | 73.61 | 13.6 | 26.8 GB/s | 8.4% | 0.8% |
-| GEMV | 9.50 | 105.3 | 208.0 GB/s | 65.0% | 0.1% |
+| GPU (peak bandwidth) | Decode path | ms / token | tokens / s | Weight bandwidth | % of peak | Spread |
+|---|---|---:|---:|---:|---:|---:|
+| Tesla T4 (320 GB/s) | Register-tiled GEMM | 73.61 | 13.6 | 26.8 GB/s | 8.4% | 0.8% |
+| Tesla T4 (320 GB/s) | GEMV | 9.50 | 105.3 | 208.0 GB/s | 65.0% | 0.1% |
+| A100 40 GB (1,555 GB/s) | Register-tiled GEMM | 71.36 | 14.0 | 27.7 GB/s | 1.8% | 0.0% |
+| A100 40 GB (1,555 GB/s) | GEMV | 5.02 | 199.3 | 393.8 GB/s | 25.3% | 0.0% |
 
-Tesla T4, a 7-token prompt then 64 decode steps, median of 7 reps after a 2 s warm-up (`make run-qwen`). The GEMV path is **7.75× faster**, and one decode step computed both ways agrees to 1.5e-06.
+A 7-token prompt then 64 decode steps, median of 7 reps after a 2 s warm-up (`make run-qwen`). The GEMV path is **7.75× faster on the T4 and 14.2× faster on the A100**. On both GPUs, one decode step computed both ways agrees to 1.5e-06.
 
-**The GEMM path is compute-bound on padding.** A decode step needs 0.99 GFLOP of useful arithmetic: one multiply-add for each of 494M weights. The GEMM performs 128 times that, about 126 GFLOP per token, of which 127/128 multiplies zeros. At 73.6 ms per token that is 1.7 TFLOP/s: the kernel is busy, just on the wrong problem.
+**The GEMM path is limited by padding, spread over too few blocks.** A decode step needs 0.99 GFLOP of useful arithmetic: one multiply-add for each of 494M weights. The GEMM performs 128 times that, about 126 GFLOP per token, of which 127/128 multiplies zeros. A one-row GEMM also launches only one block per 128 output columns: 7 for the 896-wide projections and 1 for the 128-wide keys and values. That is why the A100, with 2.7 times the T4's SMs and 4.9 times its bandwidth, runs this path barely faster: 71.4 ms against 73.6.
 
 **The GEMV is memory-bound by design.** It has no padding and nothing to reuse, since each weight is read once and used for exactly one multiply-add, so its speed is how fast the weights stream in. Each block owns 32 output columns. Eight threads cover them with one 16-byte `float4` load each, a full 128-byte line per row, and the block's 256 threads keep 32 rows in flight. Partial sums are combined in shared memory in a fixed order, so the output is identical from run to run.
 
-**The ceiling is 162 tokens/s.** Every decode step must read all 1.98 GB of fp32 weights, which takes at least 6.2 ms at 320 GB/s, however good the kernels are. The GEMV path reaches 65% of that.
+**The ceiling is set by bandwidth.** Every decode step must read all 1.98 GB of fp32 weights: at least 6.2 ms on the T4 (162 tokens/s) and 1.3 ms on the A100 (787 tokens/s), however good the kernels are. The GEMV reaches 65% of the T4's ceiling but only 25% of the A100's.
 
-**Where the remaining 35% goes has not been measured yet.** The candidates are about 360 kernel launches and copies per token, many of them tiny; the key and value projections, only 128 columns wide, which launch just 4 blocks each; and a synchronous token upload at the start of each step, which drains the GPU's queue before the step can begin. Separating them needs a profiler, which comes next, along with FP16 weights: half the bytes per token, and twice the ceiling.
+**The gap to the ceiling looks like fixed cost.** On both GPUs, each step takes about 3.3 to 3.7 ms longer than streaming the weights at peak would: 9.50 − 6.19 ms on the T4, 5.02 − 1.27 ms on the A100. A gap that stays about the same while bandwidth grows 4.9 times is not explained by bandwidth. The likely causes are costs that do not shrink on a bigger GPU: about 360 kernel launches and copies per token, many of them tiny; projections too narrow to fill the GPU (keys and values launch 4 GEMV blocks each); and a synchronous token upload at the start of every step, which drains the GPU's queue. That is an inference, not yet a measurement. A profiler comes next to confirm it, and the order of work follows: cut the per-step fixed cost (CUDA graphs, fused projections), then FP16 weights, which halve the bytes and matter most on the T4.
 
 ## Results
 
@@ -302,7 +305,7 @@ make run-qwen         # decode speed: GEMM path vs GEMV path
 | 6 | End-to-end MLP forward pass vs PyTorch | done |
 | 7 | Qwen2.5-0.5B end to end: RMSNorm, RoPE, grouped-query attention, KV cache, SwiGLU, checked against Hugging Face | done |
 | 8 | GEMV for single-token decode | done |
-| 9 | Profile decode; FP16 weights and tensor cores | next |
+| 9 | Profile decode; cut per-step overhead (CUDA graphs, fused projections); FP16 weights | next |
 | 10 | FlashAttention-style attention for prefill | planned |
 | 11 | INT8 weight-only quantization | planned |
 | 12 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
