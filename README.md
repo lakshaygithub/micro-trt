@@ -2,7 +2,41 @@
 
 A minimal CUDA inference engine written from scratch in C++17 — hand-written kernels, no cuBLAS, no cuDNN.
 
-The goal is to run a neural network forward pass entirely on custom CUDA kernels, optimizing each stage against the GPU memory hierarchy and measuring the result honestly at every step.
+It runs Qwen2.5-0.5B, a 494M-parameter language model, end to end on its own kernels. Its greedy output matches Hugging Face token for token, and it decodes 105 tokens/s on a Tesla T4: 65% of the fastest the card's memory bandwidth allows. Each stage is optimized against the GPU memory hierarchy and measured honestly along the way.
+
+## Qwen2.5-0.5B, end to end
+
+micro-trt runs a real language model on its own kernels: Qwen2.5-0.5B, 494M parameters, 24 transformer layers with RMSNorm, rotary position embeddings, grouped-query attention over a KV cache, and SwiGLU MLPs. The weights are exported from Hugging Face once (`tools/export_qwen.py`); from then on the C++ engine never touches PyTorch.
+
+### Correctness against Hugging Face
+
+Both implementations are compared with Hugging Face on a 7-token prompt at 37 checkpoints: the embedding output, every intermediate inside layer 0, all 24 layer outputs, the final norm and the logits.
+
+| Implementation | Worst relative error | Greedy tokens matching Hugging Face |
+|---|---:|---:|
+| CPU reference, `tests/check_qwen.cpp` | 6.3e-05 | first token |
+| GPU engine, `tests/check_qwen_gpu.cu` | 4.4e-05 | 32 / 32 |
+
+Relative error is max |difference| ÷ max |reference| per tensor, and the pass threshold is 1e-3. That threshold was set from both sides. Correct code that only sums in a different order stays below 1e-4. Four real architecture bugs planted in the CPU reference (RoPE pairing adjacent dimensions instead of i and i + d/2, the wrong query-to-KV head mapping, a dropped key bias, attention scaled by 1/d instead of 1/√d) each miss by 45% to 99.7% at the first checkpoint they reach, and each changes the predicted token.
+
+### Decode: a GEMV instead of a GEMM
+
+Text is generated one token at a time, so during decode every projection multiplies a single row by a weight matrix. The register-tiled GEMM handles that correctly, but its 128-row tiles do 128 rows of work for the one row that exists. `src/gemv.cu` is built for this shape instead:
+
+| Decode path | ms / token | tokens / s | Weight bandwidth | % of 320 GB/s | Spread |
+|---|---:|---:|---:|---:|---:|
+| Register-tiled GEMM | 73.61 | 13.6 | 26.8 GB/s | 8.4% | 0.8% |
+| GEMV | 9.50 | 105.3 | 208.0 GB/s | 65.0% | 0.1% |
+
+Tesla T4, a 7-token prompt then 64 decode steps, median of 7 reps after a 2 s warm-up (`make run-qwen`). The GEMV path is **7.75× faster**, and one decode step computed both ways agrees to 1.5e-06.
+
+**The GEMM path is compute-bound on padding.** A decode step needs 0.99 GFLOP of useful arithmetic: one multiply-add for each of 494M weights. The GEMM performs 128 times that, about 126 GFLOP per token, of which 127/128 multiplies zeros. At 73.6 ms per token that is 1.7 TFLOP/s: the kernel is busy, just on the wrong problem.
+
+**The GEMV is memory-bound by design.** It has no padding and nothing to reuse, since each weight is read once and used for exactly one multiply-add, so its speed is how fast the weights stream in. Each block owns 32 output columns. Eight threads cover them with one 16-byte `float4` load each, a full 128-byte line per row, and the block's 256 threads keep 32 rows in flight. Partial sums are combined in shared memory in a fixed order, so the output is identical from run to run.
+
+**The ceiling is 162 tokens/s.** Every decode step must read all 1.98 GB of fp32 weights, which takes at least 6.2 ms at 320 GB/s, however good the kernels are. The GEMV path reaches 65% of that.
+
+**Where the remaining 35% goes has not been measured yet.** The candidates are about 360 kernel launches and copies per token, many of them tiny; the key and value projections, only 128 columns wide, which launch just 4 blocks each; and a synchronous token upload at the start of each step, which drains the GPU's queue before the step can begin. Separating them needs a profiler, which comes next, along with FP16 weights: half the bytes per token, and twice the ceiling.
 
 ## Results
 
@@ -247,6 +281,15 @@ make ARCH=sm_75              # T4=sm_75, A100=sm_80, RTX 40xx/L4=sm_89, H100=sm_
 ./bench_gemm 2048 9          # size, reps
 ```
 
+Qwen2.5-0.5B needs PyTorch and `transformers` once, to export the weights and record Hugging Face's activations:
+
+```bash
+make qwen-files       # writes ~2.5 GB to models/
+make check-qwen       # CPU reference vs Hugging Face (no GPU needed)
+make check-qwen-gpu   # GPU engine vs Hugging Face, plus 32 greedy tokens
+make run-qwen         # decode speed: GEMM path vs GEMV path
+```
+
 ## Roadmap
 
 | Stage | Kernel | Status |
@@ -257,7 +300,12 @@ make ARCH=sm_75              # T4=sm_75, A100=sm_80, RTX 40xx/L4=sm_89, H100=sm_
 | 4 | Fused GEMM + bias + ReLU (single pass) | done |
 | 5 | Softmax with parallel reduction (warp shuffles, online single-pass) | done |
 | 6 | End-to-end MLP forward pass vs PyTorch | done |
-| 7 | CUDA streams — overlap H2D transfer with compute | planned |
+| 7 | Qwen2.5-0.5B end to end: RMSNorm, RoPE, grouped-query attention, KV cache, SwiGLU, checked against Hugging Face | done |
+| 8 | GEMV for single-token decode | done |
+| 9 | Profile decode; FP16 weights and tensor cores | next |
+| 10 | FlashAttention-style attention for prefill | planned |
+| 11 | INT8 weight-only quantization | planned |
+| 12 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
 
 ## Design notes
 
@@ -283,5 +331,5 @@ Known remaining inefficiencies in `gemm_regtiled`, roughly in order of expected 
 4. **A-tile global loads take two transactions per warp** rather than one, because a warp spans two rows of a 16-wide tile.
 5. **No tensor cores.** The T4 has them, but they require fp16 or TF32 and the `wmma` API — arguably a different kernel rather than an optimization of this one.
 
-This has not yet been benchmarked against cuBLAS on the same hardware, so no claim is made about relative performance.
+The end-to-end MLP above is compared against PyTorch, which calls cuBLAS; a kernel-by-kernel comparison with cuBLAS on the same shapes has not been run yet.
 
