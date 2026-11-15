@@ -11,10 +11,10 @@
 // ---------------------------------------------------------------------------
 // Qwen2.5 inference on micro-trt's own kernels.
 //
-// Every projection is a GEMM from the earlier stages -- gemm_bias for q, k and
-// v, which carry biases in Qwen2, and gemm_regtiled for the rest -- and every
-// operation between them is in src/transformer.cu. Nothing calls cuBLAS or
-// cuDNN.
+// Every projection goes through project(): the register-tiled GEMM when a call
+// carries several tokens (prefill), and a GEMV when it carries one (decode).
+// Every operation between projections is in src/transformer.cu. Nothing calls
+// cuBLAS or cuDNN.
 //
 // One forward() serves both phases of generation:
 //   prefill -- the whole prompt at once:   forward(prompt, pos = 0, ...)
@@ -75,7 +75,15 @@ public:
 
     const QwenConfig& config() const { return cfg_; }
 
+    // Single-token projections use the GEMV (the default) or, when switched
+    // off, the same tiled GEMM as prefill. The switch exists so the benchmark
+    // and the GPU check can run both paths on identical inputs.
+    void set_decode_gemv(bool on) { decode_gemv_ = on; }
+
 private:
+    // y = x * W (+ bias), choosing GEMM or GEMV by the number of rows in x.
+    void project(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& y) const;
+
     QwenConfig cfg_;
     int max_seq_;
     Tensor embed_;       // vocab x hidden: a lookup table, not transposed
@@ -84,4 +92,5 @@ private:
     Tensor inv_freq_;    // 1 x head_dim/2, RoPE inverse frequencies
     std::vector<QwenLayer> layers_;
     int* d_tokens_ = nullptr;  // device copy of the token ids being processed
+    bool decode_gemv_ = true;
 };

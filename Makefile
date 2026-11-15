@@ -15,7 +15,7 @@ LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
 
 BINS := bench_gemm bench_fusion bench_softmax bench_mlp
 
-.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen check-qwen-gpu
+.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen check-qwen-gpu run-qwen
 
 all: $(BINS)
 
@@ -53,7 +53,7 @@ compare: bench_mlp
 # transformers; ~2.5 GB written to models/), then check the CPU reference
 # forward pass against them layer by layer.
 QWEN_MODEL ?= Qwen/Qwen2.5-0.5B
-QWEN_SRCS  := src/weights.cpp src/transformer.cu src/qwen.cu
+QWEN_SRCS  := src/weights.cpp src/transformer.cu src/gemv.cu src/qwen.cu
 
 qwen-files:
 	python3 tools/export_qwen.py $(QWEN_MODEL) models/qwen
@@ -74,5 +74,13 @@ check_qwen_gpu: $(LIB_SRCS) $(QWEN_SRCS) tests/check_qwen_gpu.cu tests/reference
 check-qwen-gpu: check_qwen_gpu
 	./check_qwen_gpu models/qwen models/ref
 
+# Decode speed: the GEMM path against the GEMV path, in tokens/s and as a share
+# of the GPU's memory bandwidth.
+bench_qwen: $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu
+	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu -o $@
+
+run-qwen: bench_qwen
+	./bench_qwen models/qwen models/ref
+
 clean:
-	rm -f $(BINS) check_qwen check_qwen_gpu mlp_dump.bin
+	rm -f $(BINS) check_qwen check_qwen_gpu bench_qwen mlp_dump.bin

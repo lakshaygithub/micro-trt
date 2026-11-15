@@ -9,5 +9,6 @@ bench_gemm
 build/
 check_qwen
 check_qwen_gpu
+bench_qwen
 models/
 __pycache__/

@@ -36,8 +36,14 @@ public:
 
     explicit ReferenceCheck(const WeightFile& ref) : ref_(ref) {}
 
+    // Compares against what Hugging Face recorded under `name`.
     void compare(const std::string& name, const std::vector<float>& got) {
-        const std::vector<float> want = ref_.host(name);
+        compare(name, got, ref_.host(name));
+    }
+
+    // Compares against any expected values, such as a second implementation's.
+    void compare(const std::string& name, const std::vector<float>& got,
+                 const std::vector<float>& want) {
         if (want.size() != got.size()) {
             std::printf("  %-18s SHAPE MISMATCH (%zu vs %zu values)\n",
                         name.c_str(), got.size(), want.size());

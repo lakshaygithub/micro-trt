@@ -1,7 +1,8 @@
 // The GPU forward pass, checked against Hugging Face the way
 // tests/check_qwen.cpp checks the CPU reference: every recorded activation
 // during prefill, then the whole greedy continuation, token for token, through
-// the KV cache.
+// the KV cache. One decode step is also computed by both projection paths,
+// GEMM and GEMV, which must agree to within rounding.
 //
 // Usage:  ./check_qwen_gpu [weights_prefix] [reference_prefix]
 //         defaults: models/qwen  models/ref
@@ -36,7 +37,22 @@ int main(int argc, char** argv) {
         if (R.has(name)) check.compare(name, t.download());
     });
 
+    // ---- one decode step, GEMV against the GEMM path ----
+    // The same step computed both ways should differ only by rounding. Both
+    // runs write KV-cache row T, each from its own keys and values.
+    const int T = static_cast<int>(prompt.size());
+    const std::vector<int> first = {R.ints("generated").front()};
+    Activations one(c, 1);
+    model.set_decode_gemv(false);
+    model.forward(first, T, one);
+    const std::vector<float> by_gemm = one.logits.download();
+    model.set_decode_gemv(true);
+    model.forward(first, T, one);
+    std::printf("\nOne decode step, GEMV against the GEMM path:\n");
+    check.compare("decode_logits", one.logits.download(), by_gemm);
+
     // ---- decode: the full greedy continuation, through the KV cache ----
+    // generate() uses the GEMV for every single-token step.
     const std::vector<int>& want = R.ints("generated");
     const std::vector<int> got = model.generate(prompt, static_cast<int>(want.size()));
 

@@ -108,3 +108,15 @@ void silu_mul_inplace(Tensor& gate, const Tensor& up);
 
 // x += y, elementwise: a residual connection.
 void add_inplace(Tensor& x, const Tensor& y);
+
+// ---------------------------------------------------------------------------
+// GEMV: the one-row case of GEMM, y = x * W, with x (1 x K), W (K x N) and
+// y (1 x N). Decode runs one token at a time, so every projection is this
+// shape. Each weight is read once and used once, which makes the kernel
+// limited by memory bandwidth alone. N must be a multiple of 4.
+// ---------------------------------------------------------------------------
+
+void gemv(const Tensor& x, const Tensor& W, Tensor& y);
+
+// y = x * W + bias, with bias (1 x N).
+void gemv_bias(const Tensor& x, const Tensor& W, const Tensor& bias, Tensor& y);

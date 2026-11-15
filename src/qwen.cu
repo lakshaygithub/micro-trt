@@ -101,6 +101,20 @@ Qwen::~Qwen() {
     }
 }
 
+// Prefill sends many rows through each projection, which suits the tiled GEMM.
+// Decode sends one, where the GEMM's 128-row tiles would spend 127/128 of their
+// multiply-adds on padding, so it goes to the GEMV, which reads each weight
+// exactly once.
+void Qwen::project(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& y) const {
+    if (decode_gemv_ && x.rows() == 1) {
+        if (bias != nullptr) gemv_bias(x, W, *bias, y);
+        else                 gemv(x, W, y);
+    } else {
+        if (bias != nullptr) gemm_bias(x, W, *bias, y);
+        else                 gemm_regtiled(x, W, y);
+    }
+}
+
 void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
                    const Tap& tap) {
     const int T = static_cast<int>(tokens.size());
@@ -128,9 +142,9 @@ void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
         rmsnorm(a.x, L.attn_norm, eps, a.norm);
         probe("attn_norm_out", a.norm);
 
-        gemm_bias(a.norm, L.wq, L.bq, a.q);
-        gemm_bias(a.norm, L.wk, L.bk, a.k);
-        gemm_bias(a.norm, L.wv, L.bv, a.v);
+        project(a.norm, L.wq, &L.bq, a.q);
+        project(a.norm, L.wk, &L.bk, a.k);
+        project(a.norm, L.wv, &L.bv, a.v);
         probe("q", a.q);
         probe("k", a.k);
         probe("v", a.v);
@@ -148,7 +162,7 @@ void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
         attention(a.q, L.k_cache, L.v_cache, pos, cfg_.heads, cfg_.kv_heads, a.ctx);
         probe("attn_ctx", a.ctx);
 
-        gemm_regtiled(a.ctx, L.wo, a.proj);
+        project(a.ctx, L.wo, nullptr, a.proj);
         probe("attn_out", a.proj);
         add_inplace(a.x, a.proj);
 
@@ -156,10 +170,10 @@ void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
         rmsnorm(a.x, L.mlp_norm, eps, a.norm);
         probe("mlp_norm_out", a.norm);
 
-        gemm_regtiled(a.norm, L.w_gate, a.gate);
-        gemm_regtiled(a.norm, L.w_up, a.up);
+        project(a.norm, L.w_gate, nullptr, a.gate);
+        project(a.norm, L.w_up, nullptr, a.up);
         silu_mul_inplace(a.gate, a.up);
-        gemm_regtiled(a.gate, L.w_down, a.proj);
+        project(a.gate, L.w_down, nullptr, a.proj);
         probe("mlp_out", a.proj);
         add_inplace(a.x, a.proj);
 
@@ -169,7 +183,7 @@ void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
     rmsnorm(a.x, final_norm_, eps, a.norm);
     if (tap) tap("final_norm_out", a.norm);
 
-    gemm_regtiled(a.norm, lm_head_, a.logits);
+    project(a.norm, lm_head_, nullptr, a.logits);
     if (tap) tap("logits", a.logits);
 }
 
