@@ -7,7 +7,37 @@
 #include <cstddef>
 #include <string>
 
+// NVTX ranges label stretches of CPU time on an Nsight Systems timeline. The
+// header ships with the CUDA toolkit; without it, the ranges compile away.
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define MTRT_HAVE_NVTX 1
+#else
+#define MTRT_HAVE_NVTX 0
+#endif
+
 namespace {
+
+// Marks a scope as one named range -- "decode step", "prefill" -- from
+// construction to destruction. NVTX does next to nothing when no profiler is
+// attached, so the ranges stay on in normal runs.
+class ProfileRange {
+public:
+    explicit ProfileRange(const char* name) {
+#if MTRT_HAVE_NVTX
+        nvtxRangePushA(name);
+#else
+        (void)name;
+#endif
+    }
+    ~ProfileRange() {
+#if MTRT_HAVE_NVTX
+        nvtxRangePop();
+#endif
+    }
+    ProfileRange(const ProfileRange&) = delete;
+    ProfileRange& operator=(const ProfileRange&) = delete;
+};
 
 Tensor load(const WeightFile& w, const std::string& name) {
     Tensor t(w.rows(name), w.cols(name));
@@ -118,6 +148,9 @@ void Qwen::project(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor&
 void Qwen::forward(const std::vector<int>& tokens, int pos, Activations& a,
                    const Tap& tap) {
     const int T = static_cast<int>(tokens.size());
+    // On the CPU side this range spans the time spent issuing the step's work;
+    // set against the GPU's kernel times, it shows which side limits decode.
+    const ProfileRange range(T == 1 ? "decode step" : "prefill");
     require(T == a.tokens, "forward: Activations were sized for a different token count");
     require(pos >= 0 && pos + T <= max_seq_, "forward: positions exceed max_seq");
     for (int id : tokens) {

@@ -5,8 +5,9 @@
 // ceiling, so besides tokens per second this reports the bandwidth each path
 // reaches as a share of the GPU's peak.
 //
-// Usage:  ./bench_qwen [weights_prefix] [reference_prefix] [decode_steps] [reps]
-//         defaults: models/qwen  models/ref  64  7
+// Usage:  ./bench_qwen [weights_prefix] [reference_prefix] [decode_steps] [reps] [path]
+//         defaults: models/qwen  models/ref  64  7  both
+//         path: both, gemm or gemv -- one path alone keeps a profile focused
 
 #include "cuda_utils.h"
 #include "qwen.h"
@@ -87,7 +88,12 @@ int main(int argc, char** argv) {
     const std::string rprefix = argc > 2 ? argv[2] : "models/ref";
     const int steps = argc > 3 ? std::atoi(argv[3]) : 64;
     const int reps = argc > 4 ? std::atoi(argv[4]) : 7;
+    const std::string path = argc > 5 ? argv[5] : "both";
     require(steps > 0 && reps > 0, "bench_qwen: decode_steps and reps must be positive");
+    require(path == "both" || path == "gemm" || path == "gemv",
+            "bench_qwen: path must be both, gemm or gemv");
+    const bool run_gemm = path != "gemv";
+    const bool run_gemv = path != "gemm";
 
     const WeightFile W(wprefix);
     const WeightFile R(rprefix);
@@ -125,8 +131,10 @@ int main(int argc, char** argv) {
     Activations prefill(c, static_cast<int>(prompt.size()));
     Activations step(c, 1);
 
-    const Result gemm = measure(model, false, prompt, prefill, step, steps, reps);
-    const Result gemv = measure(model, true, prompt, prefill, step, steps, reps);
+    Result gemm{};
+    Result gemv{};
+    if (run_gemm) gemm = measure(model, false, prompt, prefill, step, steps, reps);
+    if (run_gemv) gemv = measure(model, true, prompt, prefill, step, steps, reps);
 
     std::printf("%-5s %10s %10s %16s %10s %8s\n",
                 "path", "ms/token", "tokens/s", "weights, GB/s", "% of peak", "spread");
@@ -137,8 +145,10 @@ int main(int argc, char** argv) {
                     100.0 * gbs / peak_gbs,
                     100.0 * (r.max_ms - r.min_ms) / r.median_ms);
     };
-    row("GEMM", gemm);
-    row("GEMV", gemv);
-    std::printf("\nGEMV speedup over GEMM: %.2fx\n", gemm.median_ms / gemv.median_ms);
+    if (run_gemm) row("GEMM", gemm);
+    if (run_gemv) row("GEMV", gemv);
+    if (run_gemm && run_gemv) {
+        std::printf("\nGEMV speedup over GEMM: %.2fx\n", gemm.median_ms / gemv.median_ms);
+    }
     return 0;
 }

@@ -15,7 +15,7 @@ LIB_SRCS := src/tensor.cu src/gemm_naive.cu src/gemm_tiled.cu \
 
 BINS := bench_gemm bench_fusion bench_softmax bench_mlp
 
-.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen check-qwen-gpu run-qwen
+.PHONY: all clean run run-fusion run-softmax run-mlp compare qwen-files check-qwen check-qwen-gpu run-qwen profile-qwen
 
 all: $(BINS)
 
@@ -82,5 +82,13 @@ bench_qwen: $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu
 run-qwen: bench_qwen
 	./bench_qwen models/qwen models/ref
 
+# Nsight Systems profile of decode on the GEMV path. Needs nsys on the PATH
+# (bash tools/install_nsys.sh installs it on Colab). Prints time tables per
+# kernel, per CUDA API call and per NVTX range, and writes
+# decode_profile.nsys-rep to open in the Nsight Systems app.
+profile-qwen: bench_qwen
+	nsys profile --trace=cuda,nvtx --stats=true --force-overwrite=true \
+	    -o decode_profile ./bench_qwen models/qwen models/ref 64 3 gemv
+
 clean:
-	rm -f $(BINS) check_qwen check_qwen_gpu bench_qwen mlp_dump.bin
+	rm -f $(BINS) check_qwen check_qwen_gpu bench_qwen mlp_dump.bin decode_profile.*

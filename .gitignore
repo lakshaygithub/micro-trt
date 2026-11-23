@@ -4,6 +4,7 @@ bench_gemm
 *.cubin
 *.ncu-rep
 *.nsys-rep
+*.sqlite
 *.qdrep
 .DS_Store
 build/

@@ -291,6 +291,7 @@ make qwen-files       # writes ~2.5 GB to models/
 make check-qwen       # CPU reference vs Hugging Face (no GPU needed)
 make check-qwen-gpu   # GPU engine vs Hugging Face, plus 32 greedy tokens
 make run-qwen         # decode speed: GEMM path vs GEMV path
+make profile-qwen     # Nsight Systems profile of decode (bash tools/install_nsys.sh installs nsys)
 ```
 
 ## Roadmap
