@@ -39,18 +39,23 @@ A 7-token prompt then 64 decode steps, median of 7 reps after a 2 s warm-up (`ma
 
 **The ceiling is set by bandwidth.** Every decode step must read all 1.98 GB of fp32 weights: at least 6.2 ms on the T4 (162 tokens/s) and 1.3 ms on the A100 (787 tokens/s), however good the kernels are. The GEMV reaches 65% of the T4's ceiling but only 25% of the A100's.
 
-**Where the time goes, measured.** On both GPUs each step takes about 3.3 to 3.7 ms longer than streaming the weights at peak would, and an earlier version of this README guessed the cause was fixed per-step overhead: kernel launches and a synchronous token upload. Nsight Systems says otherwise for the T4. A profile of 384 decode steps (`make profile-qwen`) splits the 9.6 ms step like this:
+**Where the time goes, measured.** On both GPUs each step takes about 3.3 to 3.7 ms longer than streaming the weights at peak would. Earlier versions of this README guessed the cause was fixed per-step overhead (kernel launches and a synchronous token upload), first for both GPUs and then for the A100. Nsight Systems profiles (`make profile-qwen`) say otherwise for both:
 
-| Per decode step, Tesla T4 | Time | Share |
+| Per decode step | Tesla T4 | A100 |
 |---|---:|---:|
-| GEMV kernels (169 per step) | 8.27 ms | 86% |
-| Attention | 0.58 ms | 6% |
-| RMSNorm, RoPE, residual adds, SwiGLU, KV-cache copies | 0.45 ms | 5% |
-| GPU idle | 0.30 ms | 3% |
+| GEMV kernels (169 per step) | 8.27 ms (86%) | 3.37 ms (65%) |
+| Attention | 0.58 ms (6%) | 0.74 ms (14%) |
+| RMSNorm, RoPE, residual adds, SwiGLU, KV-cache copies | 0.45 ms (5%) | 0.60 ms (12%) |
+| GPU idle | 0.30 ms (3%) | 0.44 ms (9%) |
+| Whole step | 9.60 ms | 5.15 ms |
 
-The GPU is busy 97% of each step, so launch overhead is not the limit here: the CPU issues a step's 363 kernel launches in about 3 ms, then waits for the GPU. The missing third is the GEMV kernels themselves, which move the weights at 239 GB/s (75% of peak) when measured alone, plus attention and the small kernels. On the A100 the balance probably flips. Its GPU work per step is far smaller while the CPU still needs about 3 ms to issue it, so there decode is likely limited by launches; that has not been profiled yet.
+The GPU is busy 97% of each step on the T4 and 91% on the A100, so launch overhead is not the main limit on either: the CPU issues a step's 363 kernel launches in 2.4 to 2.9 ms, then waits. What differs is how well the GPU's time is spent.
 
-The order of work follows from this: FP16 weights first, since halving the bytes attacks 86% of a T4 step, then CUDA graphs and fused projections to cut the launch cost that should dominate on the A100.
+- **On the T4, the GEMV is the step.** It moves the weights at 239 GB/s, 75% of peak, and everything else is small.
+- **On the A100, the GEMV reaches only 586 GB/s, 38% of peak, because it cannot fill the GPU.** The LM head, one huge matrix, streams at about 1.4 TB/s, 89% of peak. The narrow projections launch too few blocks for 108 SMs: the key and value GEMVs move under 50 GB/s.
+- **Attention and the small kernels do not speed up at all.** They are limited by latency rather than bandwidth: decode attention runs one warp per head, and each RMSNorm a single warp. They take a little longer on the A100 than on the T4, whose clock is faster, and grow to 26% of an A100 step.
+
+That is why the gap stayed about the same size across GPUs: most of it is GPU work limited by parallelism or latency, which more bandwidth does not speed up. The fixes differ by GPU. FP16 weights halve the bytes behind 86% of a T4 step. The A100 needs its work spread wider: fused Q/K/V and gate/up projections, narrow GEMVs split along K across more blocks, and decode attention spread over more than one warp per head, with CUDA graphs for the last few percent.
 
 ## Results
 
@@ -319,10 +324,11 @@ make profile-qwen     # Nsight Systems profile of decode (bash tools/install_nsy
 | 8 | GEMV for single-token decode | done |
 | 9 | Profile decode with Nsight Systems | done |
 | 10 | FP16 weights: halve the bytes every decode step reads | next |
-| 11 | Cut per-step launch cost: CUDA graphs, fused projections | planned |
-| 12 | FlashAttention-style attention for prefill | planned |
-| 13 | INT8 weight-only quantization | planned |
-| 14 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
+| 11 | Fill bigger GPUs: fused projections, split-K GEMV, multi-warp decode attention | planned |
+| 12 | CUDA graphs to remove the remaining launch gaps | planned |
+| 13 | FlashAttention-style attention for prefill | planned |
+| 14 | INT8 weight-only quantization | planned |
+| 15 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
 
 ## Design notes
 
