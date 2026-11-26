@@ -67,28 +67,30 @@ check-qwen: check_qwen
 	./check_qwen models/qwen models/ref
 
 # The same checks against the GPU forward pass, plus a full greedy decode
-# through the KV cache compared token for token.
+# through the KV cache compared token for token: once with the projection
+# weights in fp32, once in fp16.
 check_qwen_gpu: $(LIB_SRCS) $(QWEN_SRCS) tests/check_qwen_gpu.cu tests/reference_check.h
 	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) $(QWEN_SRCS) tests/check_qwen_gpu.cu -o $@
 
 check-qwen-gpu: check_qwen_gpu
-	./check_qwen_gpu models/qwen models/ref
+	./check_qwen_gpu models/qwen models/ref fp32
+	./check_qwen_gpu models/qwen models/ref fp16
 
-# Decode speed: the GEMM path against the GEMV path, in tokens/s and as a share
-# of the GPU's memory bandwidth.
+# Decode speed: the GEMM and GEMV paths, each with fp32 and fp16 weights, in
+# tokens/s and as a share of the GPU's memory bandwidth.
 bench_qwen: $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu
 	$(NVCC) $(NVCC_FLAGS) $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu -o $@
 
 run-qwen: bench_qwen
 	./bench_qwen models/qwen models/ref
 
-# Nsight Systems profile of decode on the GEMV path. Needs nsys on the PATH
-# (bash tools/install_nsys.sh installs it on Colab). Prints time tables per
-# kernel, per CUDA API call and per NVTX range, and writes
+# Nsight Systems profile of decode on the GEMV path with fp16 weights. Needs
+# nsys on the PATH (bash tools/install_nsys.sh installs it on Colab). Prints
+# time tables per kernel, per CUDA API call and per NVTX range, and writes
 # decode_profile.nsys-rep to open in the Nsight Systems app.
 profile-qwen: bench_qwen
 	nsys profile --trace=cuda,nvtx --stats=true --force-overwrite=true \
-	    -o decode_profile ./bench_qwen models/qwen models/ref 64 3 gemv
+	    -o decode_profile ./bench_qwen models/qwen models/ref 64 3 gemv fp16
 
 clean:
 	rm -f $(BINS) check_qwen check_qwen_gpu bench_qwen mlp_dump.bin decode_profile.*

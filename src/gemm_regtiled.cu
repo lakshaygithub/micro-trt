@@ -77,10 +77,21 @@ struct BiasOnly {
     }
 };
 
-template <typename Epilogue>
+// ---------------------------------------------------------------------------
+// B in fp32 or fp16
+//
+// Model weights may be stored in fp16 to halve the bytes they take. Each B
+// element is widened to fp32 as it is copied into shared memory, so from the
+// tile onward the kernel is the same for both: same tiles, same fp32
+// multiply-adds. For fp32 B the conversion is a no-op and compiles away.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float to_float(float v) { return v; }
+__device__ __forceinline__ float to_float(__half v) { return __half2float(v); }
+
+template <typename BT, typename Epilogue>  // BT: float or __half
 __global__ __launch_bounds__(THREADS)
 void gemm_regtiled_kernel(const float* __restrict__ A,
-                          const float* __restrict__ B,
+                          const BT* __restrict__ B,
                           float* __restrict__ C,
                           int M, int N, int K,
                           Epilogue epilogue) {
@@ -138,7 +149,7 @@ void gemm_regtiled_kernel(const float* __restrict__ A,
             const int r = k_base + b_inner_row + off;
             const int c = block_col + b_inner_col;
             Bs[b_inner_row + off][b_inner_col] =
-                (r < K && c < N) ? B[static_cast<std::size_t>(r) * N + c] : 0.0f;
+                (r < K && c < N) ? to_float(B[static_cast<std::size_t>(r) * N + c]) : 0.0f;
         }
 
         // No thread may read the tiles until every thread has finished writing.
@@ -191,9 +202,10 @@ void gemm_regtiled_kernel(const float* __restrict__ A,
     }
 }
 
-// Shared launch configuration for every instantiation.
-template <typename Epilogue>
-void launch(const Tensor& A, const Tensor& B, Tensor& C, Epilogue epilogue) {
+// Shared launch configuration for every instantiation. Weights is Tensor (fp32
+// B) or HalfTensor (fp16 B); the kernel's BT follows from B.data().
+template <typename Weights, typename Epilogue>
+void launch(const Tensor& A, const Weights& B, Tensor& C, Epilogue epilogue) {
     const int M = A.rows();
     const int K = A.cols();
     const int N = B.cols();
@@ -223,6 +235,17 @@ void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
 }
 
 void gemm_bias(const Tensor& A, const Tensor& B,
+               const Tensor& bias, Tensor& C) {
+    require(bias.size() == static_cast<std::size_t>(B.cols()),
+            "gemm_bias: bias needs one entry per output column");
+    launch(A, B, C, BiasOnly{bias.data()});
+}
+
+void gemm_regtiled(const Tensor& A, const HalfTensor& B, Tensor& C) {
+    launch(A, B, C, Identity{});
+}
+
+void gemm_bias(const Tensor& A, const HalfTensor& B,
                const Tensor& bias, Tensor& C) {
     require(bias.size() == static_cast<std::size_t>(B.cols()),
             "gemm_bias: bias needs one entry per output column");

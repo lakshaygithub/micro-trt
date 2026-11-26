@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <utility>
 
 // NVTX ranges label stretches of CPU time on an Nsight Systems timeline. The
 // header ships with the CUDA toolkit; without it, the ranges compile away.
@@ -45,6 +46,34 @@ Tensor load(const WeightFile& w, const std::string& name) {
     return t;
 }
 
+// A projection weight in the precision asked for. fp16 is rounded on the GPU
+// from a temporary fp32 copy, which is freed on return, so loading never holds
+// more than one weight matrix in both precisions at once.
+Weight load_weight(const WeightFile& w, const std::string& name, WeightPrecision p) {
+    Weight out;
+    Tensor t = load(w, name);
+    if (p == WeightPrecision::fp16) {
+        out.fp16.emplace(t);
+    } else {
+        out.fp32.emplace(std::move(t));
+    }
+    return out;
+}
+
+// One projection with whichever kernels fit: Weights is Tensor or HalfTensor,
+// and overloading picks the fp32 or fp16 version of each kernel.
+template <typename Weights>
+void run_projection(bool use_gemv, const Tensor& x, const Weights& W,
+                    const Tensor* bias, Tensor& y) {
+    if (use_gemv) {
+        if (bias != nullptr) gemv_bias(x, W, *bias, y);
+        else                 gemv(x, W, y);
+    } else {
+        if (bias != nullptr) gemm_bias(x, W, *bias, y);
+        else                 gemm_regtiled(x, W, y);
+    }
+}
+
 std::string layer_name(int layer, const char* name) {
     return "L" + std::to_string(layer) + "." + name;
 }
@@ -80,28 +109,30 @@ Activations::Activations(const QwenConfig& c, int n)
       gate(n, c.intermediate), up(n, c.intermediate),
       logits(n, c.vocab) {}
 
-QwenLayer::QwenLayer(const WeightFile& w, int layer, int max_seq, int kv_dim)
+QwenLayer::QwenLayer(const WeightFile& w, int layer, int max_seq, int kv_dim,
+                     WeightPrecision p)
     : attn_norm(load(w, layer_name(layer, "attn_norm"))),
-      wq(load(w, layer_name(layer, "wq"))),
+      wq(load_weight(w, layer_name(layer, "wq"), p)),
       bq(load(w, layer_name(layer, "bq"))),
-      wk(load(w, layer_name(layer, "wk"))),
+      wk(load_weight(w, layer_name(layer, "wk"), p)),
       bk(load(w, layer_name(layer, "bk"))),
-      wv(load(w, layer_name(layer, "wv"))),
+      wv(load_weight(w, layer_name(layer, "wv"), p)),
       bv(load(w, layer_name(layer, "bv"))),
-      wo(load(w, layer_name(layer, "wo"))),
+      wo(load_weight(w, layer_name(layer, "wo"), p)),
       mlp_norm(load(w, layer_name(layer, "mlp_norm"))),
-      w_gate(load(w, layer_name(layer, "w_gate"))),
-      w_up(load(w, layer_name(layer, "w_up"))),
-      w_down(load(w, layer_name(layer, "w_down"))),
+      w_gate(load_weight(w, layer_name(layer, "w_gate"), p)),
+      w_up(load_weight(w, layer_name(layer, "w_up"), p)),
+      w_down(load_weight(w, layer_name(layer, "w_down"), p)),
       k_cache(max_seq, kv_dim),
       v_cache(max_seq, kv_dim) {}
 
-Qwen::Qwen(const WeightFile& w, int max_seq)
+Qwen::Qwen(const WeightFile& w, int max_seq, WeightPrecision precision)
     : cfg_(QwenConfig::from(w)),
       max_seq_(max_seq),
+      precision_(precision),
       embed_(load(w, "embed")),
       final_norm_(load(w, "final_norm")),
-      lm_head_(load(w, "lm_head")),
+      lm_head_(load_weight(w, "lm_head", precision)),
       inv_freq_(1, cfg_.head_dim / 2) {
     require(max_seq > 0, "Qwen: max_seq must be positive");
     require(cfg_.kv_heads > 0 && cfg_.heads % cfg_.kv_heads == 0,
@@ -118,7 +149,7 @@ Qwen::Qwen(const WeightFile& w, int max_seq)
 
     layers_.reserve(cfg_.layers);
     for (int l = 0; l < cfg_.layers; ++l) {
-        layers_.emplace_back(w, l, max_seq, cfg_.kv_dim());
+        layers_.emplace_back(w, l, max_seq, cfg_.kv_dim(), precision);
     }
 
     CUDA_CHECK(cudaMalloc(&d_tokens_, static_cast<std::size_t>(max_seq) * sizeof(int)));
@@ -135,13 +166,12 @@ Qwen::~Qwen() {
 // Decode sends one, where the GEMM's 128-row tiles would spend 127/128 of their
 // multiply-adds on padding, so it goes to the GEMV, which reads each weight
 // exactly once.
-void Qwen::project(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& y) const {
-    if (decode_gemv_ && x.rows() == 1) {
-        if (bias != nullptr) gemv_bias(x, W, *bias, y);
-        else                 gemv(x, W, y);
+void Qwen::project(const Tensor& x, const Weight& W, const Tensor* bias, Tensor& y) const {
+    const bool use_gemv = decode_gemv_ && x.rows() == 1;
+    if (W.fp16) {
+        run_projection(use_gemv, x, *W.fp16, bias, y);
     } else {
-        if (bias != nullptr) gemm_bias(x, W, *bias, y);
-        else                 gemm_regtiled(x, W, y);
+        run_projection(use_gemv, x, *W.fp32, bias, y);
     }
 }
 

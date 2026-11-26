@@ -5,6 +5,7 @@
 #include "weights.h"
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,8 +14,9 @@
 //
 // Every projection goes through project(): the register-tiled GEMM when a call
 // carries several tokens (prefill), and a GEMV when it carries one (decode).
-// Every operation between projections is in src/transformer.cu. Nothing calls
-// cuBLAS or cuDNN.
+// Both read the projection weights in fp32 or fp16, whichever the model was
+// loaded with, and compute in fp32 either way. Every operation between
+// projections is in src/transformer.cu. Nothing calls cuBLAS or cuDNN.
 //
 // One forward() serves both phases of generation:
 //   prefill -- the whole prompt at once:   forward(prompt, pos = 0, ...)
@@ -39,14 +41,38 @@ struct Activations {
     Tensor logits;    //                             T x vocab
 };
 
+// How the projection weights are stored on the GPU: the seven matrices of each
+// layer plus the LM head, nearly all of the bytes a decode step reads. Decode
+// reads every one of them for each token, so their size sets its speed limit,
+// and fp16 halves it. Activations, biases, norm weights, the embedding table
+// and all arithmetic stay fp32.
+//
+// For Qwen2.5 the conversion is close to lossless: the checkpoint is bf16, and
+// every bf16 value in fp16's normal range is exactly representable in fp16.
+enum class WeightPrecision { fp32, fp16 };
+
+inline const char* precision_name(WeightPrecision p) {
+    return p == WeightPrecision::fp16 ? "fp16" : "fp32";
+}
+
+// One projection's weight matrix, stored (in x out) in either precision.
+// Exactly one of the two is filled.
+struct Weight {
+    std::optional<Tensor> fp32;
+    std::optional<HalfTensor> fp16;
+};
+
 struct QwenLayer {
-    QwenLayer(const WeightFile& w, int layer, int max_seq, int kv_dim);
+    QwenLayer(const WeightFile& w, int layer, int max_seq, int kv_dim, WeightPrecision p);
 
     Tensor attn_norm;
-    Tensor wq, bq, wk, bk, wv, bv, wo;  // projection weights stored (in x out)
+    Weight wq;  Tensor bq;   // projection weights, stored (in x out)
+    Weight wk;  Tensor bk;
+    Weight wv;  Tensor bv;
+    Weight wo;
     Tensor mlp_norm;
-    Tensor w_gate, w_up, w_down;
-    Tensor k_cache, v_cache;            // max_seq x kv_heads*head_dim, post-RoPE
+    Weight w_gate, w_up, w_down;
+    Tensor k_cache, v_cache; // max_seq x kv_heads*head_dim, post-RoPE
 };
 
 // Called at each point where Hugging Face's activations were recorded, with the
@@ -56,9 +82,11 @@ using Tap = std::function<void(const std::string& name, const Tensor& value)>;
 
 class Qwen {
 public:
-    // Uploads every weight (~2.5 GB for Qwen2.5-0.5B in fp32) and allocates a
-    // KV cache for max_seq positions.
-    Qwen(const WeightFile& weights, int max_seq);
+    // Uploads every weight and allocates a KV cache for max_seq positions. For
+    // Qwen2.5-0.5B the weights take ~2.5 GB of GPU memory in fp32 and ~1.5 GB
+    // with fp16 projections.
+    Qwen(const WeightFile& weights, int max_seq,
+         WeightPrecision precision = WeightPrecision::fp16);
     ~Qwen();
 
     Qwen(const Qwen&) = delete;
@@ -74,6 +102,7 @@ public:
     std::vector<int> generate(const std::vector<int>& prompt, int n_new);
 
     const QwenConfig& config() const { return cfg_; }
+    WeightPrecision precision() const { return precision_; }
 
     // Single-token projections use the GEMV (the default) or, when switched
     // off, the same tiled GEMM as prefill. The switch exists so the benchmark
@@ -81,14 +110,16 @@ public:
     void set_decode_gemv(bool on) { decode_gemv_ = on; }
 
 private:
-    // y = x * W (+ bias), choosing GEMM or GEMV by the number of rows in x.
-    void project(const Tensor& x, const Tensor& W, const Tensor* bias, Tensor& y) const;
+    // y = x * W (+ bias), choosing GEMM or GEMV by the number of rows in x,
+    // and the fp32 or fp16 version of each by how W is stored.
+    void project(const Tensor& x, const Weight& W, const Tensor* bias, Tensor& y) const;
 
     QwenConfig cfg_;
     int max_seq_;
+    WeightPrecision precision_;
     Tensor embed_;       // vocab x hidden: a lookup table, not transposed
     Tensor final_norm_;
-    Tensor lm_head_;     // hidden x vocab
+    Weight lm_head_;     // hidden x vocab
     Tensor inv_freq_;    // 1 x head_dim/2, RoPE inverse frequencies
     std::vector<QwenLayer> layers_;
     int* d_tokens_ = nullptr;  // device copy of the token ids being processed

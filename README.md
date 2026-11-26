@@ -305,9 +305,9 @@ Qwen2.5-0.5B needs PyTorch and `transformers` once, to export the weights and re
 ```bash
 make qwen-files       # writes ~2.5 GB to models/
 make check-qwen       # CPU reference vs Hugging Face (no GPU needed)
-make check-qwen-gpu   # GPU engine vs Hugging Face, plus 32 greedy tokens
-make run-qwen         # decode speed: GEMM path vs GEMV path
-make profile-qwen     # Nsight Systems profile of decode (bash tools/install_nsys.sh installs nsys)
+make check-qwen-gpu   # GPU engine vs Hugging Face, plus 32 greedy tokens: fp32, then fp16 weights
+make run-qwen         # decode speed: GEMM and GEMV paths, each with fp32 and fp16 weights
+make profile-qwen     # Nsight Systems profile of fp16 decode (bash tools/install_nsys.sh installs nsys)
 ```
 
 ## Roadmap

@@ -1,6 +1,7 @@
 #pragma once
 
 class Tensor;
+class HalfTensor;
 
 // C = A * B, where A is (M x K), B is (K x N), C is (M x N), all row-major.
 //
@@ -48,6 +49,13 @@ void gemm_bias_relu_fused(const Tensor& A, const Tensor& B,
 // classifier, where a softmax follows and ReLU would clamp away the negative
 // logits it operates on.
 void gemm_bias(const Tensor& A, const Tensor& B,
+               const Tensor& bias, Tensor& C);
+
+// The same two GEMMs with B in fp16: model weights stored in 2 bytes each.
+// Each weight is widened to fp32 as it is staged into shared memory, so the
+// arithmetic is identical to the fp32 version.
+void gemm_regtiled(const Tensor& A, const HalfTensor& B, Tensor& C);
+void gemm_bias(const Tensor& A, const HalfTensor& B,
                const Tensor& bias, Tensor& C);
 
 // ---------------------------------------------------------------------------
@@ -113,10 +121,16 @@ void add_inplace(Tensor& x, const Tensor& y);
 // GEMV: the one-row case of GEMM, y = x * W, with x (1 x K), W (K x N) and
 // y (1 x N). Decode runs one token at a time, so every projection is this
 // shape. Each weight is read once and used once, which makes the kernel
-// limited by memory bandwidth alone. N must be a multiple of 4.
+// limited by memory bandwidth alone. N must be a multiple of 4 for fp32
+// weights and of 8 for fp16 weights: one 16-byte load each.
 // ---------------------------------------------------------------------------
 
 void gemv(const Tensor& x, const Tensor& W, Tensor& y);
 
 // y = x * W + bias, with bias (1 x N).
 void gemv_bias(const Tensor& x, const Tensor& W, const Tensor& bias, Tensor& y);
+
+// The same with W in fp16, which halves the bytes the kernel must stream.
+// x, y and bias stay fp32, and so does every multiply-add.
+void gemv(const Tensor& x, const HalfTensor& W, Tensor& y);
+void gemv_bias(const Tensor& x, const HalfTensor& W, const Tensor& bias, Tensor& y);

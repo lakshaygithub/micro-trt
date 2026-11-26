@@ -4,9 +4,14 @@
 // the KV cache. One decode step is also computed by both projection paths,
 // GEMM and GEMV, which must agree to within rounding.
 //
-// Usage:  ./check_qwen_gpu [weights_prefix] [reference_prefix]
-//         defaults: models/qwen  models/ref
+// The projection weights can be held in fp32 or fp16; `make check-qwen-gpu`
+// runs both. Hugging Face's reference is fp32 either way, so the fp16 run is
+// held to the same tolerance as the fp32 one.
+//
+// Usage:  ./check_qwen_gpu [weights_prefix] [reference_prefix] [precision]
+//         defaults: models/qwen  models/ref  fp16      precision: fp16 or fp32
 
+#include "cuda_utils.h"
 #include "qwen.h"
 #include "reference_check.h"
 #include "tensor.h"
@@ -19,12 +24,18 @@
 int main(int argc, char** argv) {
     const std::string wprefix = argc > 1 ? argv[1] : "models/qwen";
     const std::string rprefix = argc > 2 ? argv[2] : "models/ref";
+    const std::string precision_arg = argc > 3 ? argv[3] : "fp16";
+    require(precision_arg == "fp16" || precision_arg == "fp32",
+            "check_qwen_gpu: precision must be fp16 or fp32");
+    const WeightPrecision precision =
+        precision_arg == "fp16" ? WeightPrecision::fp16 : WeightPrecision::fp32;
+
     const WeightFile W(wprefix);
     const WeightFile R(rprefix);
     ReferenceCheck check(R);
 
-    std::printf("Uploading weights ...\n");
-    Qwen model(W, /*max_seq=*/1024);
+    std::printf("Uploading weights, projections in %s ...\n", precision_name(precision));
+    Qwen model(W, /*max_seq=*/1024, precision);
     const QwenConfig& c = model.config();
     std::printf("Qwen2: %d layers, hidden %d, %d/%d heads, head_dim %d, ffn %d, vocab %d\n\n",
                 c.layers, c.hidden, c.heads, c.kv_heads, c.head_dim, c.intermediate, c.vocab);
@@ -66,6 +77,11 @@ int main(int argc, char** argv) {
     }
 
     std::printf("\nWorst relative error: %.2e (%s)\n", check.worst(), check.worst_name().c_str());
-    std::printf("%s\n", check.failures() ? "FAILED" : "GPU forward pass matches Hugging Face");
+    if (check.failures()) {
+        std::printf("FAILED, %s weights\n", precision_name(precision));
+    } else {
+        std::printf("GPU forward pass matches Hugging Face, %s weights\n",
+                    precision_name(precision));
+    }
     return check.failures() ? 1 : 0;
 }
