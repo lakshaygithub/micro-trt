@@ -84,13 +84,18 @@ bench_qwen: $(LIB_SRCS) $(QWEN_SRCS) bench/bench_qwen.cu
 run-qwen: bench_qwen
 	./bench_qwen models/qwen models/ref
 
-# Nsight Systems profile of decode on the GEMV path with fp16 weights. Needs
-# nsys on the PATH (bash tools/install_nsys.sh installs it on Colab). Prints
-# time tables per kernel, per CUDA API call and per NVTX range, and writes
+# Nsight Systems profile of decode on the GEMV path, by default with fp32 and
+# fp16 weights in one run. Needs nsys on the PATH (bash tools/install_nsys.sh
+# installs it on Colab). Prints time tables per kernel, per CUDA API call and
+# per NVTX range, then the GEMV time split by projection, and writes
 # decode_profile.nsys-rep to open in the Nsight Systems app.
+PROFILE_PRECISION ?= both
+
 profile-qwen: bench_qwen
+	rm -f decode_profile.sqlite
 	nsys profile --trace=cuda,nvtx --stats=true --force-overwrite=true \
-	    -o decode_profile ./bench_qwen models/qwen models/ref 64 3 gemv fp16
+	    -o decode_profile ./bench_qwen models/qwen models/ref 64 3 gemv $(PROFILE_PRECISION)
+	python3 tools/gemv_breakdown.py decode_profile.sqlite models/qwen
 
 clean:
 	rm -f $(BINS) check_qwen check_qwen_gpu bench_qwen mlp_dump.bin decode_profile.*
