@@ -21,36 +21,35 @@ namespace {
 // also why storing W in fp16 pays: half the bytes to stream for the same work.
 //
 // Work layout. W is stored (in x out), row-major, so each row of W is
-// contiguous along the output dimension. One block owns a strip of COLS = 32
-// output columns and walks every row of it. Every thread reads 16 bytes at a
-// time, which is four fp32 weights or eight fp16 weights:
+// contiguous along the output dimension. One block owns a strip of COLS output
+// columns and walks every row of it. Every thread reads 16 bytes at a time:
+// four fp32 weights or eight fp16 weights. LANES threads cover one row of the
+// strip, the block's 256 threads form GROUPS such teams, and team g takes rows
+// g, g + GROUPS, g + 2*GROUPS, ...
 //
-//                          fp32 weights   fp16 weights
-//   weights per load, VEC        4              8
-//   threads per row, LANES       8              4
-//   bytes read per row         128             64
-//   rows in flight, GROUPS      32             64
+//                               fp32     fp16     fp16, wide W
+//   columns per block, COLS      32       32          64
+//   weights per load, VEC         4        8           8
+//   threads per row, LANES        8        4           8
+//   bytes read per row          128       64         128
+//   rows in flight, GROUPS       32       64          32
 //
-// LANES threads cover one row of the strip; the block's 256 threads form
-// GROUPS such teams, and team g takes rows g, g + GROUPS, g + 2*GROUPS, ...
-//
-// fp16 keeps 32 columns per block instead of widening the strip to 64. Wider
-// strips would halve the number of blocks, and the narrow projections already
-// launch too few blocks to fill a large GPU. The cost is a 64-byte read per
-// row instead of 128, which is still two whole 32-byte memory sectors, so no
-// fetched byte goes unused. With twice the rows in flight, a block keeps the
-// same number of bytes on the way from memory as in fp32.
+// The strip width trades two needs against each other. A team should read
+// whole 128-byte rows: profiled on a T4, fp16 with 64-byte rows streamed the
+// LM head at 57% of peak bandwidth, where fp32 with 128-byte rows reached 73%.
+// But every SM needs a block to run, and the narrow projections already launch
+// too few blocks to fill a large GPU, so halving the count everywhere would
+// cost more than it saves. fp16 therefore uses 64-column strips only where
+// they still give every SM at least one block -- on a T4, the MLP's gate and
+// up projections and the LM head -- and 32-column strips everywhere else.
 //
 // Each team ends with partial sums over its own rows. A shared-memory pass then
 // adds the teams' partials for each column, in a fixed order, so the result is
-// identical from run to run. All arithmetic is fp32 in both versions; fp16
+// identical from run to run. All arithmetic is fp32 in every version; fp16
 // weights are widened to fp32 in registers before they are used.
 // ---------------------------------------------------------------------------
 
-constexpr int COLS    = 32;   // output columns per block
 constexpr int THREADS = 256;
-
-static_assert(COLS <= THREADS, "the final pass needs one thread per column");
 
 // Reads the 16 bytes at p as weights, widened to fp32: four floats as they are,
 // or eight fp16 values converted.
@@ -75,7 +74,7 @@ __device__ __forceinline__ void load_weights(const __half* p, float (&w)[8]) {
     }
 }
 
-template <typename WT>  // weight type: float or __half
+template <typename WT, int COLS>  // weight type (float or __half), strip width
 __global__ __launch_bounds__(THREADS)
 void gemv_kernel(const float* __restrict__ x,
                  const WT* __restrict__ W,
@@ -87,6 +86,7 @@ void gemv_kernel(const float* __restrict__ x,
     constexpr int GROUPS = THREADS / LANES;                    // rows in flight
     static_assert(COLS % VEC == 0 && THREADS % LANES == 0,
                   "block must split into whole row teams");
+    static_assert(COLS <= THREADS, "the final pass needs one thread per column");
 
     // float4 stores into this array need 16-byte alignment.
     __shared__ __align__(16) float partial[GROUPS][COLS];
@@ -138,8 +138,20 @@ void gemv_kernel(const float* __restrict__ x,
     }
 }
 
+// Streaming multiprocessors on the current GPU, read once.
+int sm_count() {
+    static const int count = [] {
+        int dev = 0;
+        int n = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+        return n;
+    }();
+    return count;
+}
+
 // W points at a K x N matrix of fp32 or fp16 weights; the kernel version is
-// picked from its type.
+// picked from its type, and for fp16 also from the matrix's width.
 template <typename WT>
 void launch(const Tensor& x, const WT* W, int K, int N, const Tensor* bias, Tensor& y) {
     constexpr int VEC = static_cast<int>(16 / sizeof(WT));
@@ -149,10 +161,18 @@ void launch(const Tensor& x, const WT* W, int K, int N, const Tensor* bias, Tens
                                    : "gemv: N must be a multiple of 8 for 16-byte fp16 loads");
     require(bias == nullptr || bias->size() == static_cast<std::size_t>(N),
             "gemv_bias: bias needs one entry per output column");
+    const float* b = bias != nullptr ? bias->data() : nullptr;
 
-    const int blocks = (N + COLS - 1) / COLS;
-    gemv_kernel<<<blocks, THREADS>>>(x.data(), W, bias != nullptr ? bias->data() : nullptr,
-                                     y.data(), K, N);
+    // fp16 takes 64-column strips, and so 128-byte rows, wherever that still
+    // leaves every SM at least one block (see the table at the top).
+    if constexpr (sizeof(WT) == 2) {
+        if (N / 64 >= sm_count()) {
+            gemv_kernel<WT, 64><<<(N + 63) / 64, THREADS>>>(x.data(), W, b, y.data(), K, N);
+            CUDA_CHECK_LAST();
+            return;
+        }
+    }
+    gemv_kernel<WT, 32><<<(N + 31) / 32, THREADS>>>(x.data(), W, b, y.data(), K, N);
     CUDA_CHECK_LAST();
 }
 
