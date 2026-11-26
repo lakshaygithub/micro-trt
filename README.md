@@ -2,7 +2,7 @@
 
 A minimal CUDA inference engine written from scratch in C++17 — hand-written kernels, no cuBLAS, no cuDNN.
 
-It runs Qwen2.5-0.5B, a 494M-parameter language model, end to end on its own kernels. Its greedy output matches Hugging Face token for token, and it decodes 105 tokens/s on a Tesla T4 (65% of the fastest the card's memory bandwidth allows) and 199 tokens/s on an A100. Each stage is optimized against the GPU memory hierarchy and measured honestly along the way.
+It runs Qwen2.5-0.5B, a 494M-parameter language model, end to end on its own kernels. Its greedy output matches Hugging Face token for token, with the weights stored in fp32 or fp16. With fp16 weights it decodes 170 tokens/s on a Tesla T4, 1.63× its fp32 speed; in fp32 it decodes 199 tokens/s on an A100. Each stage is optimized against the GPU memory hierarchy and measured honestly along the way.
 
 ## Qwen2.5-0.5B, end to end
 
@@ -15,8 +15,9 @@ Both implementations are compared with Hugging Face on a 7-token prompt at 37 ch
 | Implementation | Worst relative error | Greedy tokens matching Hugging Face |
 |---|---:|---:|
 | CPU reference, `tests/check_qwen.cpp` | 6.3e-05 | first token |
-| GPU engine on a T4, `tests/check_qwen_gpu.cu` | 4.4e-05 | 32 / 32 |
-| GPU engine on an A100 | 3.3e-05 | 32 / 32 |
+| GPU engine on a T4, `tests/check_qwen_gpu.cu`, fp32 weights | 4.4e-05 | 32 / 32 |
+| GPU engine on a T4, fp16 weights | 3.0e-05 | 32 / 32 |
+| GPU engine on an A100, fp32 weights | 3.3e-05 | 32 / 32 |
 
 Relative error is max |difference| ÷ max |reference| per tensor, and the pass threshold is 1e-3. That threshold was set from both sides. Correct code that only sums in a different order stays below 1e-4. Four real architecture bugs planted in the CPU reference (RoPE pairing adjacent dimensions instead of i and i + d/2, the wrong query-to-KV head mapping, a dropped key bias, attention scaled by 1/d instead of 1/√d) each miss by 45% to 99.7% at the first checkpoint they reach, and each changes the predicted token.
 
@@ -56,6 +57,37 @@ The GPU is busy 97% of each step on the T4 and 91% on the A100, so launch overhe
 - **Attention and the small kernels do not speed up at all.** They are limited by latency rather than bandwidth: decode attention runs one warp per head, and each RMSNorm a single warp. They take a little longer on the A100 than on the T4, whose clock is faster, and grow to 26% of an A100 step.
 
 That is why the gap stayed about the same size across GPUs: most of it is GPU work limited by parallelism or latency, which more bandwidth does not speed up. The fixes differ by GPU. FP16 weights halve the bytes behind 86% of a T4 step. The A100 needs its work spread wider: fused Q/K/V and gate/up projections, narrow GEMVs split along K across more blocks, and decode attention spread over more than one warp per head, with CUDA graphs for the last few percent.
+
+### FP16 weights
+
+On the T4 the profile left one dominant cost: streaming the weights, 86% of a step at 75% of peak bandwidth. The bandwidth was already close to its practical limit, so the lever left was the number of bytes. The projection weights and the LM head are now stored in fp16, 2 bytes each instead of 4 (`HalfTensor`, rounded once on the GPU while the model loads). Every kernel widens them back to fp32 in registers, so all arithmetic is still fp32 and only the storage shrank. The GEMV reads eight fp16 weights per 16-byte load instead of four floats, and the tiled GEMM widens fp16 weights as it stages them into shared memory, so prefill reads the same copy.
+
+**It costs no accuracy on this model.** Qwen2.5 ships in bf16, and fp16 represents every bf16 value in its normal range exactly. Converting the 494M projection weights changes 120,769 of them (0.02%), all smaller than fp16's smallest normal number (6.1e-5), and none by more than 3e-8. With fp16 weights the GPU engine matches Hugging Face to 3.0e-05 at worst, against 4.4e-05 in fp32, and still generates all 32 tokens identically.
+
+| Tesla T4 | Weights | ms / token | tokens / s | Weight bandwidth | % of peak | Spread |
+|---|---|---:|---:|---:|---:|---:|
+| Register-tiled GEMM | fp32 | 73.95 | 13.5 | 26.7 GB/s | 8.3% | 1.0% |
+| Register-tiled GEMM | fp16 | 80.74 | 12.4 | 12.2 GB/s | 3.8% | 0.4% |
+| GEMV | fp32 | 9.59 | 104.3 | 206.0 GB/s | 64.4% | 0.1% |
+| GEMV | fp16 | 5.89 | **169.8** | 167.7 GB/s | 52.4% | 0.3% |
+
+All four rows come from one session (`make run-qwen`). fp16 weights make decode **1.63× faster**. Their ceiling on the T4 is 324 tokens/s: 0.99 GB per step at 320 GB/s.
+
+**The GEMM path got slower, as a path limited by arithmetic should.** It moves 27 GB/s on a 320 GB/s bus, so its speed was never set by bytes. Halving them saves nothing, and converting each weight back to fp32 adds work: 8% slower.
+
+**The first fp16 GEMV fell short, and the profile showed why.** I predicted 1.6 to 1.7×; the first version measured 1.47×. `make profile-qwen` now ends with `tools/gemv_breakdown.py`, which labels every GEMV launch by its projection and reports the bandwidth each one reaches:
+
+| Projection (K × N) | fp32 | fp16, first version | fp16, final |
+|---|---:|---:|---:|
+| LM head (896 × 151936) | 73% | 57% | 73% |
+| gate, up (896 × 4864) | 77% | 65–66% | 76% |
+| down (4864 × 896) | 81% | 72% | 71% |
+| q, o (896 × 896) | 69–71% | 55–57% | 53–55% |
+| k, v (896 × 128) | 20% | 14% | 13% |
+
+Share of the T4's peak bandwidth reached per launch. Each block of the GEMV streams a strip of 32 output columns: 128 bytes of every row in fp32, but only 64 in fp16, and the big matrices streamed those smaller reads less efficiently. The LM head suffered most, because each of its thousands of short-lived blocks now did half the work. fp16 now uses 64-column strips, 128-byte rows like fp32, wherever that still leaves every SM at least one block: on the T4, gate, up and the LM head. Those matrices returned to fp32's rate, each launch now 2× faster than in fp32, and decode reached 169.8 tokens/s, against a prediction of about 170.
+
+**What is left.** The GEMVs as a whole are now 1.86× faster than in fp32, but a step is only 1.63× faster, because two parts do not scale with bytes. The narrow projections (q, o, k, v) gain just 1.3 to 1.55×: they launch too few blocks to reach full bandwidth, so much of their time is fixed per launch. And attention, the norms and the other small kernels, about 1.5 ms per step, read no weights at all. fp16 leaves them untouched, and they are now a quarter of a step. Both point at the same next steps as before: fewer, larger launches (fused projections, split-K GEMVs) and CUDA graphs.
 
 ## Results
 
@@ -323,8 +355,8 @@ make profile-qwen     # Nsight Systems profile of decode, then GEMV time per pro
 | 7 | Qwen2.5-0.5B end to end: RMSNorm, RoPE, grouped-query attention, KV cache, SwiGLU, checked against Hugging Face | done |
 | 8 | GEMV for single-token decode | done |
 | 9 | Profile decode with Nsight Systems | done |
-| 10 | FP16 weights: halve the bytes every decode step reads | next |
-| 11 | PyTorch custom op: call the GEMV from Python, tested against `torch.matmul` | planned |
+| 10 | FP16 weights: halve the bytes every decode step reads | done |
+| 11 | PyTorch custom op: call the GEMV from Python, tested against `torch.matmul` | next |
 | 12 | Triton GEMV, benchmarked against the CUDA GEMV from the same Python script | planned |
 | 13 | Fill bigger GPUs: fused projections, split-K GEMV, multi-warp decode attention | planned |
 | 14 | CUDA graphs to remove the remaining launch gaps | planned |
