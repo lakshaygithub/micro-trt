@@ -324,11 +324,13 @@ make profile-qwen     # Nsight Systems profile of decode (bash tools/install_nsy
 | 8 | GEMV for single-token decode | done |
 | 9 | Profile decode with Nsight Systems | done |
 | 10 | FP16 weights: halve the bytes every decode step reads | next |
-| 11 | Fill bigger GPUs: fused projections, split-K GEMV, multi-warp decode attention | planned |
-| 12 | CUDA graphs to remove the remaining launch gaps | planned |
-| 13 | FlashAttention-style attention for prefill | planned |
-| 14 | INT8 weight-only quantization | planned |
-| 15 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
+| 11 | PyTorch custom op: call the GEMV from Python, tested against `torch.matmul` | planned |
+| 12 | Triton GEMV, benchmarked against the CUDA GEMV from the same Python script | planned |
+| 13 | Fill bigger GPUs: fused projections, split-K GEMV, multi-warp decode attention | planned |
+| 14 | CUDA graphs to remove the remaining launch gaps | planned |
+| 15 | FlashAttention-style attention for prefill | planned |
+| 16 | INT8 weight-only quantization | planned |
+| 17 | Benchmarks against llama.cpp and vLLM; serving with continuous batching | planned |
 
 ## Design notes
 
